@@ -1,0 +1,14 @@
+{
+  "test": "HDD Sequential 64K, direct=1 (direct I/O)",
+  "date": "2026-07-14",
+  "file": "/mnt/hdd/nsd_hdd_test.dat (4GB, sdb5, ntfs-3g)",
+  "runs": {
+    "off": [
+      { "run": 1, "bw_mbps": 103, "iops": 1648, "lat_us": 606 }
+    ],
+    "on": [
+      { "run": 1, "bw_mbps": 103, "iops": 1648, "lat_us": 606 }
+    ]
+  },
+  "result": "~0% (vfs_fadvise ignored with direct I/O)"
+}

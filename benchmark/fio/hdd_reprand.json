@@ -1,0 +1,14 @@
+{
+  "test": "HDD Repeated Random 4K, direct=1, randrepeat=1",
+  "date": "2026-07-14",
+  "file": "/mnt/hdd/nsd_hdd_test.dat (4GB, sdb5, ntfs-3g)",
+  "runs": {
+    "off": [
+      { "run": 1, "bw_mbps": 0.4, "iops": 106, "lat_us": 9448 }
+    ],
+    "on": [
+      { "run": 1, "bw_mbps": 0.4, "iops": 106, "lat_us": 9467 }
+    ]
+  },
+  "result": "~0% (1GB file too large for transition repetition in 30s)"
+}

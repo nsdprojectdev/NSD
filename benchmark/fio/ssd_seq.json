@@ -1,0 +1,18 @@
+{
+  "test": "SSD Sequential 64K, direct=0, buffered I/O",
+  "date": "2026-07-14",
+  "file": "/home/nsd/nsd_test_ssd.dat (8GB, sda1)",
+  "runs": {
+    "off": [
+      { "run": 1, "bw_mbps": 390, "iops": 6240, "lat_us": 160 },
+      { "run": 2, "bw_mbps": 388, "iops": 6208, "lat_us": 162 },
+      { "run": 3, "bw_mbps": 392, "iops": 6272, "lat_us": 159 }
+    ],
+    "on": [
+      { "run": 1, "bw_mbps": 470, "iops": 7520, "lat_us": 132 },
+      { "run": 2, "bw_mbps": 468, "iops": 7488, "lat_us": 134 },
+      { "run": 3, "bw_mbps": 472, "iops": 7552, "lat_us": 130 }
+    ]
+  },
+  "result": "+20.5% bandwidth, −18% latency"
+}

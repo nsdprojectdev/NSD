@@ -1,0 +1,17 @@
+NSD (Neural Storage Driver)
+Copyright (c) 2026 Ayhan Aydin
+
+This project is dual-licensed.
+You may choose ONE of the following licenses:
+
+1. GNU General Public License v2.0 only (GPL-2.0-only)
+   OR
+2. Commercial License
+
+If you are distributing or using NSD as part of a proprietary,
+closed-source, or commercial product, you must obtain a commercial
+license from the copyright holder.
+
+Commercial licensing inquiries: nsd.project.dev@gmail.com
+
+See the LICENSES directory for the full GPL-2.0 license text.

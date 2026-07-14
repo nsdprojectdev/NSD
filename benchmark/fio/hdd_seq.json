@@ -1,0 +1,18 @@
+{
+  "test": "HDD Sequential 64K, direct=0, buffered I/O",
+  "date": "2026-07-14",
+  "file": "/mnt/hdd/nsd_hdd_test.dat (4GB, sdb5, ntfs-3g)",
+  "runs": {
+    "off": [
+      { "run": 1, "bw_mbps": 149.8, "iops": 2397, "lat_us": 411, "note": "cold cache" },
+      { "run": 2, "bw_mbps": 198.5, "iops": 3176, "lat_us": 309 },
+      { "run": 3, "bw_mbps": 201.7, "iops": 3227, "lat_us": 304 }
+    ],
+    "on": [
+      { "run": 1, "bw_mbps": 189.6, "iops": 3034, "lat_us": 324 },
+      { "run": 2, "bw_mbps": 191.5, "iops": 3064, "lat_us": 322 },
+      { "run": 3, "bw_mbps": 192.4, "iops": 3078, "lat_us": 319 }
+    ]
+  },
+  "result": "−4% (neutral, regression from −70.7% fixed)"
+}
