@@ -80,6 +80,7 @@
 #define NSD_W_INIT        400
 #define NSD_W_OBSERVE     300
 #define NSD_W_HIT         150
+#define NSD_W_PENALTY   150
 #define NSD_W_DECAY_MS    300000
 
 #define NSD_DECAY_RUNS_MIN        6
@@ -309,6 +310,8 @@ static struct {
 
     u64 pending[NSD_PENDING_SLOTS];
     u64 pending_ts[NSD_PENDING_SLOTS];
+    u32 pending_way[NSD_PENDING_SLOTS];
+    u32 pending_dst[NSD_PENDING_SLOTS];
     bool skip_kprobe[NSD_FCTX_SLOTS];
     u64 skip_ino[NSD_FCTX_SLOTS];
     u64 skip_time[NSD_FCTX_SLOTS];
@@ -509,7 +512,7 @@ static __maybe_unused void nsd_syn_strengthen(u64 key, u32 dst)
     atomic64_inc(&nsd.st_learned);
 }
 
-static __maybe_unused bool nsd_syn_predict(u64 key, u32 *dst, u16 *w)
+static __maybe_unused bool nsd_syn_predict(u64 key, u32 *dst, u16 *w, int *way_idx)
 {
     u32 bi = (u32)(key & nsd.syn_mask), hi = (u32)(key >> 32);
     struct nsd_syn_bucket *b = &nsd.syn[bi];
@@ -532,6 +535,7 @@ static __maybe_unused bool nsd_syn_predict(u64 key, u32 *dst, u16 *w)
     if (best_way >= 0) {
         *dst = b->ways[best_way].dst_region[best_dest];
         *w   = bw;
+        if (way_idx) *way_idx = best_way;
 
         if (atomic_read(&nsd.feat_fine_decay) && b->ways[best_way].last_seen_ns) {
             u64 now_ns = nsd_ns();
@@ -572,6 +576,26 @@ static __maybe_unused void nsd_syn_reward(u64 key, u32 dst)
     }
     spin_unlock(&b->lock);
 }
+
+static __maybe_unused void nsd_syn_weaken(u32 bw, u32 dst)
+{
+    u32 bi = (bw >> 8) & 0xFFFFFF;
+    u32 wi = bw & 0xFF;
+    struct nsd_syn_bucket *b = &nsd.syn[bi];
+    if (wi >= NSD_SYN_WAYS) return;
+    spin_lock(&b->lock);
+    for (int d = 0; d < b->ways[wi].dst_count; d++) {
+        if (b->ways[wi].dst_region[d] == dst && b->ways[wi].weight[d] > 0) {
+            if (b->ways[wi].weight[d] <= (u16)NSD_W_PENALTY)
+                b->ways[wi].weight[d] = 0;
+            else
+                b->ways[wi].weight[d] = b->ways[wi].weight[d] - NSD_W_PENALTY;
+            break;
+        }
+    }
+    spin_unlock(&b->lock);
+}
+
 
 static __maybe_unused void nsd_syn_decay(struct work_struct *work)
 {
@@ -961,16 +985,16 @@ static inline __maybe_unused u64 nsd_pend_hash(u32 file_id, u32 region)
     return siphash(k, sizeof(k), &nsd.hkey);
 }
 
-static inline __maybe_unused void nsd_pend_add(u64 h)
+static inline __maybe_unused void nsd_pend_add(u64 h, u32 way, u32 dst)
 {
-    WRITE_ONCE(nsd.pending[h & NSD_PENDING_MASK], h);    WRITE_ONCE(nsd.pending_ts[h & NSD_PENDING_MASK], nsd_ns());
+    WRITE_ONCE(nsd.pending[h & NSD_PENDING_MASK], h);    WRITE_ONCE(nsd.pending_ts[h & NSD_PENDING_MASK], nsd_ns());    WRITE_ONCE(nsd.pending_way[h & NSD_PENDING_MASK], way);    WRITE_ONCE(nsd.pending_dst[h & NSD_PENDING_MASK], dst);
 }
 
 static inline __maybe_unused bool nsd_pend_check(u64 h)
 {
     u32 s = (u32)(h & NSD_PENDING_MASK);
     if (READ_ONCE(nsd.pending[s]) == h) {
-        WRITE_ONCE(nsd.pending[s], 0ULL);        WRITE_ONCE(nsd.pending_ts[s], 0ULL);
+        WRITE_ONCE(nsd.pending[s], 0ULL);        WRITE_ONCE(nsd.pending_ts[s], 0ULL);        WRITE_ONCE(nsd.pending_way[s], 0);        WRITE_ONCE(nsd.pending_dst[s], 0);
         return true;
     }
     return false;
@@ -1299,6 +1323,8 @@ static __maybe_unused void nsd_do_prefetch(struct file *file, u32 file_id,
         u16  w      = 0;
         bool found  = false;
         u64  ph;
+        int  pred_way = -1;
+        u64  pred_key = 0;
 
 
         if (use_stride_chain) {
@@ -1335,8 +1361,8 @@ static __maybe_unused void nsd_do_prefetch(struct file *file, u32 file_id,
         } else if (strat != NSD_STRAT_NONE) {
         switch (strat) {
         case NSD_STRAT_BIGRAM:
-            found = nsd_syn_predict(nsd_syn_key_bigram(file_id, prev_region, r),
-                                    &next_r, &w);
+            	    pred_key = nsd_syn_key_bigram(file_id, prev_region, r);
+            found = nsd_syn_predict(pred_key, &next_r, &w, &pred_way);
 
             if (found)
                 prev_region = r;
@@ -1346,7 +1372,8 @@ static __maybe_unused void nsd_do_prefetch(struct file *file, u32 file_id,
             break;
         case NSD_STRAT_MARKOV:
         default:
-            found = nsd_syn_predict(nsd_syn_key(file_id, r), &next_r, &w);
+            pred_key = nsd_syn_key(file_id, r);
+            found = nsd_syn_predict(pred_key, &next_r, &w, &pred_way);
             break;
         }
         }
@@ -1372,7 +1399,10 @@ stride_chain_emit:
         consecutive_dup = 0;
 
 
-        nsd_pend_add(ph);
+        {
+            u32 bw = (pred_way >= 0 && pred_key != 0) ? (((u32)(pred_key & nsd.syn_mask) << 8) | ((u32)pred_way + 1)) : 0;
+            nsd_pend_add(ph, bw, next_r);
+        }
 
 
         if (coalesce_len == 0) {
@@ -1682,7 +1712,13 @@ static __maybe_unused void nsd_waste_track_fn(struct work_struct *work)
         u64 h = READ_ONCE(nsd.pending[i]);
         if (h && (now - READ_ONCE(nsd.pending_ts[i])) > expire_ns) {
             expired++;
+            {
+                u32 bw  = READ_ONCE(nsd.pending_way[i]);
+                u32 dst = READ_ONCE(nsd.pending_dst[i]);
+                if (bw) nsd_syn_weaken(bw, dst);
+            }
             WRITE_ONCE(nsd.pending[i], 0ULL);            WRITE_ONCE(nsd.pending_ts[i], 0ULL);
+            WRITE_ONCE(nsd.pending_way[i], 0);            WRITE_ONCE(nsd.pending_dst[i], 0);
         }
     }
     if (expired)
