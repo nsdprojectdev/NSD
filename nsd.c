@@ -48,15 +48,15 @@
 #define NSD_REGION_BYTES_NVME  (1UL << NSD_REGION_SHIFT_NVME)
 
 #define NSD_THRESH_HDD         700
-#define NSD_THRESH_SSD         100
+#define NSD_THRESH_SSD         180
 #define NSD_THRESH_NVME        400
 
 #define NSD_DEPTH_HDD          2
-#define NSD_DEPTH_SSD          6
+#define NSD_DEPTH_SSD          8
 #define NSD_DEPTH_NVME         2
 
 #define NSD_PREFETCH_SPAN_HDD  (4UL * 1024)
-#define NSD_PREFETCH_SPAN_SSD  (128UL * 1024)
+#define NSD_PREFETCH_SPAN_SSD  (256UL * 1024)
 #define NSD_PREFETCH_SPAN_NVME (4UL   * 1024)
 
 #define NSD_STRIDE_SPAN_MULT   2
@@ -74,7 +74,7 @@
 
 #define NSD_PROCAWARE_BUCKET_BITS   8
 
-#define NSD_SYN_WAYS          4
+#define NSD_SYN_WAYS          8
 
 #define NSD_W_MAX         1000
 #define NSD_W_INIT        400
@@ -95,37 +95,43 @@
 #define NSD_SEQ_BYPASS_THRESH_SSD   800
 #define NSD_SEQ_BYPASS_THRESH_NVME  900
 
-#define NSD_HYSTERESIS_CONFIRM  5
+#define NSD_HYST_CONFIRM_UP     2
+#define NSD_HYST_CONFIRM_UP_RND 3
+#define NSD_HYST_CONFIRM_DOWN   1
 #define NSD_HOT_SLOTS           64
 #define NSD_PCPU_SLOTS          8
 
 #define NSD_ML_WINDOW_SIZE      64
 #define NSD_ML_LR_INIT          100
-#define NSD_AUTOTHRESH_HIGH_ACC 950
-#define NSD_AUTOTHRESH_LOW_ACC  100
-#define NSD_AUTOTHRESH_STEP     10
-#define NSD_THRESH_MIN          150
+#define NSD_AUTOTHRESH_HIGH_ACC 900
+#define NSD_AUTOTHRESH_LOW_ACC  150
+#define NSD_AUTOTHRESH_STEP     25
+#define NSD_THRESH_MIN          200
 #define NSD_THRESH_MAX          500
 
 #define NSD_AUTOTHRESH_HIGH_ACC_HDD 800
 #define NSD_AUTOTHRESH_LOW_ACC_HDD  100
 #define NSD_AUTOTHRESH_STEP_HDD     10
+#define NSD_AUTOTHRESH_HIGH_ACC 900
+#define NSD_AUTOTHRESH_LOW_ACC  150
+#define NSD_AUTOTHRESH_STEP     25
 
 #define NSD_THRESH_MIN_HDD 200
 #define NSD_THRESH_MAX_HDD 500
 
-#define NSD_MON_WINDOW    128
-#define NSD_MON_DISABLE   50
-#define NSD_MON_ENABLE    100
+#define NSD_MON_WINDOW    256
+#define NSD_MON_DISABLE   30
+#define NSD_MON_ENABLE     80
 
 #define NSD_FILE_ACC_MIN           5
 #define NSD_FILE_ACC_MIN_SAMPLES   100
 
-#define NSD_RING_SIZE      128u
+#define NSD_RING_SIZE      256u
 #define NSD_RING_MASK      (NSD_RING_SIZE - 1u)
-#define NSD_PENDING_SLOTS  32768U
+#define NSD_PENDING_SLOTS  65536U
 #define NSD_PENDING_MASK   (NSD_PENDING_SLOTS - 1U)
-#define NSD_FCTX_SLOTS     64
+#define NSD_FCTX_BITS      8
+#define NSD_FCTX_SLOTS     (1 << NSD_FCTX_BITS)
 #define NSD_TELEM_MS       5000
 
 enum nsd_dev_class {
@@ -199,6 +205,12 @@ struct nsd_pcpu_slot {
 };
 
 struct nsd_pcpu_state {
+    u32  micro_seq_last_inode;
+    u32  micro_seq_last_pid;
+    loff_t micro_seq_last_offset;
+    size_t micro_seq_last_len;
+    u64  micro_seq_last_ns;
+    u32  micro_seq_hits;
     struct nsd_pcpu_slot slots[NSD_PCPU_SLOTS];
 };
 static DEFINE_PER_CPU(struct nsd_pcpu_state, nsd_cpu_state);
@@ -219,9 +231,24 @@ struct nsd_workload {
     u8   pending_confirms;
 };
 
+struct nsd_adaptive {
+    u16 historical_acc;
+    u16 recent_acc;
+    u32 recent_window[NSD_ML_WINDOW_SIZE];
+    u32 recent_idx;
+    u32 recent_sum;
+    u16 learning_rate;
+};
+struct nsd_monitor {
+    u32  window[NSD_MON_WINDOW];
+    u32  idx, sum, count;
+    bool prefetch_ok;
+};
+
 struct nsd_fctx {
     u32                file_id;
     bool               valid;
+    struct inode      *inode;
     u64                last_seen_ns;
     u64                read_count;
     struct nsd_workload wl;
@@ -237,28 +264,22 @@ struct nsd_fctx {
     u32                pf_count;
     u32                hit_count;
     u32                miss_count;
+    u32                negcache_hits;
+    u64                negcache_until;
     bool               disabled;
 
 
     u32                meta_ops;
     u32                small_io_ops;
     u64                total_bytes_read;
+    u32  depth;
+    u16  thresh;
+    u64  prefetch_span;
+    struct nsd_monitor mon;
+    struct nsd_adaptive ada;
 };
 
-struct nsd_monitor {
-    u32  window[NSD_MON_WINDOW];
-    u32  idx, sum, count;
-    bool prefetch_ok;
-};
 
-struct nsd_adaptive {
-    u16 historical_acc;
-    u16 recent_acc;
-    u32 recent_window[NSD_ML_WINDOW_SIZE];
-    u32 recent_idx;
-    u32 recent_sum;
-    u16 learning_rate;
-};
 
 static struct {
 
@@ -287,7 +308,10 @@ static struct {
 
 
     u64 pending[NSD_PENDING_SLOTS];
-
+    u64 pending_ts[NSD_PENDING_SLOTS];
+    bool skip_kprobe[NSD_FCTX_SLOTS];
+    u64 skip_ino[NSD_FCTX_SLOTS];
+    u64 skip_time[NSD_FCTX_SLOTS];
 
     struct delayed_work      decay_work;
     struct delayed_work      telem_work;
@@ -350,7 +374,7 @@ static struct {
     .feat_stride   = ATOMIC_INIT(1),
     .feat_autothresh = ATOMIC_INIT(1),
     .feat_fine_decay = ATOMIC_INIT(1),
-    .feat_procaware  = ATOMIC_INIT(0),
+.feat_procaware  = ATOMIC_INIT(1),
     .feat_waste_track = ATOMIC_INIT(0),
     .dev_class     = NSD_DEV_SSD,
     .region_shift  = NSD_REGION_SHIFT_SSD,
@@ -376,43 +400,41 @@ static void nsd_drain_rings(void);
 static unsigned long nsd_shrink_count(struct shrinker *, struct shrink_control *);
 static unsigned long nsd_shrink_scan(struct shrinker *, struct shrink_control *);
 
-static inline u64 nsd_ns(void) { return ktime_get_ns(); }
+static inline __maybe_unused u64 nsd_ns(void) { return ktime_get_ns(); }
 
-static inline u32 nsd_off_to_region(loff_t off)
+static inline __maybe_unused u32 nsd_off_to_region(loff_t off)
 {
     return (u32)((u64)off >> READ_ONCE(nsd.region_shift));
 }
 
-static u32 nsd_file_id(struct file *file)
+static __maybe_unused u32 nsd_file_id(struct file *file)
 {
     struct inode *inode = file->f_inode;
-    u64 k[2];
     if (!inode) return 0;
-    k[0] = inode->i_sb ? (u64)inode->i_sb->s_dev : 0ULL;
-    k[1] = (u64)inode->i_ino;
-    return (u32)siphash(k, sizeof(k), &nsd.hkey);
+    u64 key = inode->i_ino ^ (u64)(unsigned long)inode->i_sb;
+    return hash_64(key, NSD_FCTX_BITS);
 }
 
-static inline u64 nsd_syn_key(u32 file_id, u32 region)
+static inline __maybe_unused u64 nsd_syn_key(u32 file_id, u32 region)
 {
     u64 d[2] = { (u64)file_id, (u64)region };
     return siphash(d, sizeof(d), &nsd.hkey);
 }
 
-static inline u64 nsd_syn_key_bigram(u32 file_id, u32 prev_r, u32 cur_r)
+static inline __maybe_unused u64 nsd_syn_key_bigram(u32 file_id, u32 prev_r, u32 cur_r)
 {
     u64 d[2] = { ((u64)file_id << 32) | prev_r, (u64)cur_r };
     return siphash(d, sizeof(d), &nsd.hkey);
 }
 
-static inline u64 nsd_procaware_hash(u64 base_hash)
+static inline __maybe_unused u64 nsd_procaware_hash(u64 base_hash)
 {
     u32 tgid = current->tgid;
     u8 bucket = (u8)(tgid & ((1u << NSD_PROCAWARE_BUCKET_BITS) - 1));
     return base_hash ^ ((u64)bucket << 56);
 }
 
-static int nsd_syn_init(void)
+static __maybe_unused int nsd_syn_init(void)
 {
     u32 i, w;
     nsd.syn = kvmalloc_array(nsd.syn_buckets,
@@ -431,13 +453,13 @@ static int nsd_syn_init(void)
     return 0;
 }
 
-static void nsd_syn_free(void)
+static __maybe_unused void nsd_syn_free(void)
 {
     kvfree(nsd.syn);
     nsd.syn = NULL;
 }
 
-static void nsd_syn_strengthen(u64 key, u32 dst)
+static __maybe_unused void nsd_syn_strengthen(u64 key, u32 dst)
 {
     u32 bi = (u32)(key & nsd.syn_mask), hi = (u32)(key >> 32);
     struct nsd_syn_bucket *b = &nsd.syn[bi];
@@ -487,7 +509,7 @@ static void nsd_syn_strengthen(u64 key, u32 dst)
     atomic64_inc(&nsd.st_learned);
 }
 
-static bool nsd_syn_predict(u64 key, u32 *dst, u16 *w)
+static __maybe_unused bool nsd_syn_predict(u64 key, u32 *dst, u16 *w)
 {
     u32 bi = (u32)(key & nsd.syn_mask), hi = (u32)(key >> 32);
     struct nsd_syn_bucket *b = &nsd.syn[bi];
@@ -531,7 +553,7 @@ static bool nsd_syn_predict(u64 key, u32 *dst, u16 *w)
     return false;
 }
 
-static void nsd_syn_reward(u64 key, u32 dst)
+static __maybe_unused void nsd_syn_reward(u64 key, u32 dst)
 {
     u32 bi = (u32)(key & nsd.syn_mask), hi = (u32)(key >> 32);
     struct nsd_syn_bucket *b = &nsd.syn[bi];
@@ -551,7 +573,7 @@ static void nsd_syn_reward(u64 key, u32 dst)
     spin_unlock(&b->lock);
 }
 
-static void nsd_syn_decay(struct work_struct *work)
+static __maybe_unused void nsd_syn_decay(struct work_struct *work)
 {
     static u32 decay_runs = 0;
     u32 i, w, d;
@@ -603,7 +625,7 @@ done:
                            msecs_to_jiffies(NSD_W_DECAY_MS));
 }
 
-static void nsd_hot_update(struct nsd_fctx *ctx, u32 region, u64 now)
+static __maybe_unused void nsd_hot_update(struct nsd_fctx *ctx, u32 region, u64 now)
 {
     int i, oldest_slot = 0;
     u64 oldest_ns = ~0ULL;
@@ -636,7 +658,7 @@ static void nsd_hot_update(struct nsd_fctx *ctx, u32 region, u64 now)
     }
 }
 
-static bool nsd_hot_predict(struct nsd_fctx *ctx, u32 cur_region,
+static __maybe_unused bool nsd_hot_predict(struct nsd_fctx *ctx, u32 cur_region,
                              u32 *dst, u16 *score, u64 now)
 {
     int i, best = -1;
@@ -672,7 +694,7 @@ static bool nsd_hot_predict(struct nsd_fctx *ctx, u32 cur_region,
     return false;
 }
 
-static void nsd_stride_update(struct nsd_fctx *ctx, u32 region, s32 delta)
+static __maybe_unused void nsd_stride_update(struct nsd_fctx *ctx, u32 region, s32 delta)
 {
     if (delta == 0) {
 
@@ -692,7 +714,7 @@ static void nsd_stride_update(struct nsd_fctx *ctx, u32 region, s32 delta)
     ctx->stride_last_region = region;
 }
 
-static bool nsd_stride_predict(struct nsd_fctx *ctx, u32 cur_region,
+static __maybe_unused bool nsd_stride_predict(struct nsd_fctx *ctx, u32 cur_region,
                                 u32 *dst, u16 *score, s32 *stride_out)
 {
     s32 d0, d1, d2;
@@ -714,8 +736,19 @@ static bool nsd_stride_predict(struct nsd_fctx *ctx, u32 cur_region,
     return true;
 }
 
-static void nsd_workload_update(struct nsd_fctx *ctx, u32 region,
-                                u32 prev_region, u64 now)
+static inline int nsd_strat_rank(enum nsd_strategy s)
+{
+    switch (s) {
+    case NSD_STRAT_NONE:         return 0;
+    case NSD_STRAT_MARKOV:       return 1;
+    case NSD_STRAT_BIGRAM:       return 2;
+    case NSD_STRAT_FREQ_RECENCY: return 3;
+    }
+    return 0;
+}
+
+static __maybe_unused void nsd_workload_update(struct nsd_fctx *ctx, u32 region,
+                                 u32 prev_region, u64 now)
 {
     struct nsd_workload *w = &ctx->wl;
     s64 delta = (s64)region - (s64)prev_region;
@@ -743,31 +776,24 @@ static void nsd_workload_update(struct nsd_fctx *ctx, u32 region,
     }
 
 
-    if (w->event_count >= NSD_PROFILE_WINDOW) {
+    if (w->event_count >= NSD_PROFILE_WINDOW ||
+        ((w->event_count & 31U) == 0 && w->event_count >= 32)) {
         u32 seq_r = (w->seq_count * 1000) / w->event_count;
         u32 rpt_r = (w->repeat_count * 1000) / w->event_count;
         enum nsd_strategy proposed;
+        bool full = (w->event_count >= NSD_PROFILE_WINDOW);
 
 
-        if (nsd.dev_class == NSD_DEV_NVME && seq_r > 950) {
+        if (seq_r < 120 && rpt_r < 100) {
             proposed = NSD_STRAT_NONE;
-        } else if (nsd.dev_class == NSD_DEV_HDD && seq_r > NSD_SEQ_BYPASS_THRESH_HDD) {
-            proposed = NSD_STRAT_NONE;
-        } else if (nsd.dev_class == NSD_DEV_SSD && seq_r > NSD_SEQ_BYPASS_THRESH_SSD) {
-            proposed = NSD_STRAT_NONE;
-        } else if (nsd.dev_class == NSD_DEV_NVME && seq_r > NSD_SEQ_BYPASS_THRESH_NVME) {
-            proposed = NSD_STRAT_NONE;
-        } else if (seq_r > NSD_SEQ_BYPASS_THRESH) {
-            proposed = NSD_STRAT_NONE;
-        } else if (seq_r > NSD_SEQ_RATIO_THRESH) {
-            proposed = NSD_STRAT_MARKOV;
-        } else if (rpt_r > NSD_RPT_RATIO_THRESH) {
+        } else if (full && rpt_r > NSD_RPT_RATIO_THRESH) {
             proposed = NSD_STRAT_FREQ_RECENCY;
-        } else if (seq_r > 200 && rpt_r > 150) {
+        } else if (full && seq_r > 200 && rpt_r > 150) {
             proposed = NSD_STRAT_BIGRAM;
+        } else if (rpt_r > (full ? 75U : 200U)) {
+            proposed = NSD_STRAT_FREQ_RECENCY;
         } else {
-
-            proposed = NSD_STRAT_NONE;
+            proposed = NSD_STRAT_MARKOV;
         }
 
 
@@ -776,7 +802,16 @@ static void nsd_workload_update(struct nsd_fctx *ctx, u32 region,
             w->pending = proposed;
         } else if (proposed == w->pending) {
             w->pending_confirms++;
-            if (w->pending_confirms >= NSD_HYSTERESIS_CONFIRM) {
+            u8 thresh;
+            if (nsd_strat_rank(proposed) > nsd_strat_rank(w->active)) {
+                if (seq_r < 120 && rpt_r < 100)
+                    thresh = NSD_HYST_CONFIRM_UP_RND;
+                else
+                    thresh = NSD_HYST_CONFIRM_UP;
+            } else {
+                thresh = NSD_HYST_CONFIRM_DOWN;
+            }
+            if (w->pending_confirms >= thresh) {
                 w->active           = w->pending;
                 w->pending_confirms = 0;
                 atomic64_inc(&nsd.st_strat_switch);
@@ -787,18 +822,10 @@ static void nsd_workload_update(struct nsd_fctx *ctx, u32 region,
         }
 
 
-        if (proposed == NSD_STRAT_NONE) {
-            u32 bypass_thresh = NSD_SEQ_BYPASS_THRESH;
-            if (nsd.dev_class == NSD_DEV_HDD)
-                bypass_thresh = NSD_SEQ_BYPASS_THRESH_HDD;
-            else if (nsd.dev_class == NSD_DEV_SSD)
-                bypass_thresh = NSD_SEQ_BYPASS_THRESH_SSD;
-            else if (nsd.dev_class == NSD_DEV_NVME)
-                bypass_thresh = NSD_SEQ_BYPASS_THRESH_NVME;
+        if (proposed == NSD_STRAT_NONE && seq_r > 600)
+            atomic64_inc(&nsd.st_seq_bypass);
 
-            if (seq_r > bypass_thresh)
-                atomic64_inc(&nsd.st_seq_bypass);
-        }
+        WRITE_ONCE(nsd.skip_kprobe[ctx->file_id], false);
 
         w->seq_count    = 0;
         w->repeat_count = 0;
@@ -806,9 +833,9 @@ static void nsd_workload_update(struct nsd_fctx *ctx, u32 region,
     }
 }
 
-static void nsd_adaptive_update(bool correct)
+static __maybe_unused void nsd_adaptive_update(struct nsd_fctx *ctx, bool correct)
 {
-    struct nsd_adaptive *a = &nsd.ada;
+    struct nsd_adaptive *a = &ctx->ada;
     u32 idx;
 
     spin_lock(&nsd.ada_lock);
@@ -835,7 +862,7 @@ static void nsd_adaptive_update(bool correct)
 
 
     if (atomic_read(&nsd.feat_autothresh)) {
-        u16 cur_thresh = READ_ONCE(nsd.thresh);
+        u16 cur_thresh = ctx->thresh;
         u16 new_thresh = cur_thresh;
         u16 high_acc, low_acc, step, min_thresh, max_thresh;
 
@@ -862,14 +889,14 @@ static void nsd_adaptive_update(bool correct)
         }
 
         if (new_thresh != cur_thresh) {
-            WRITE_ONCE(nsd.thresh, new_thresh);
+            ctx->thresh = new_thresh;
             atomic64_inc(&nsd.st_autothresh_adj);
         }
 
 
         if (a->recent_acc < 100 && cur_thresh > 300) {
             u16 reset_thresh = max(min_thresh, (u16)(cur_thresh / 2));
-            WRITE_ONCE(nsd.thresh, reset_thresh);
+            ctx->thresh = reset_thresh;
             atomic64_inc(&nsd.st_autothresh_adj);
             pr_debug("NSD: death spiral recovery thresh %u -> %u\n",
                      cur_thresh, reset_thresh);
@@ -879,7 +906,7 @@ static void nsd_adaptive_update(bool correct)
     spin_unlock(&nsd.ada_lock);
 }
 
-static struct nsd_fctx *nsd_fctx_get(u32 file_id, u64 now)
+static struct nsd_fctx *nsd_fctx_get(u32 file_id, u64 now, struct inode *inode)
 {
     int i, lru = 0;
     u64 oldest = ~0ULL;
@@ -888,6 +915,10 @@ static struct nsd_fctx *nsd_fctx_get(u32 file_id, u64 now)
     for (i = 0; i < NSD_FCTX_SLOTS; i++) {
         if (nsd.fctx.e[i].valid && nsd.fctx.e[i].file_id == file_id) {
             nsd.fctx.e[i].read_count++;
+            nsd.fctx.e[i].inode = inode;
+            if (now - nsd.fctx.e[i].last_seen_ns > 100ULL * NSEC_PER_MSEC) {
+                WRITE_ONCE(nsd.skip_kprobe[file_id], false);
+            }
             nsd.fctx.e[i].last_seen_ns = now;
             return &nsd.fctx.e[i];
         }
@@ -903,10 +934,19 @@ static struct nsd_fctx *nsd_fctx_get(u32 file_id, u64 now)
 
     memset(&nsd.fctx.e[lru], 0, sizeof(nsd.fctx.e[lru]));
     nsd.fctx.e[lru].file_id      = file_id;
+    nsd.fctx.e[lru].inode        = inode;
     nsd.fctx.e[lru].valid        = true;
     nsd.fctx.e[lru].read_count   = 1;
     nsd.fctx.e[lru].last_seen_ns = now;
     nsd.fctx.e[lru].wl.active    = NSD_STRAT_MARKOV;
+    WRITE_ONCE(nsd.skip_kprobe[file_id], false);
+    nsd.fctx.e[lru].depth          = READ_ONCE(nsd.depth);
+    nsd.fctx.e[lru].thresh         = READ_ONCE(nsd.thresh);
+    nsd.fctx.e[lru].prefetch_span  = READ_ONCE(nsd.prefetch_span);
+    nsd.fctx.e[lru].ada.historical_acc = 700;
+    nsd.fctx.e[lru].ada.recent_acc     = 700;
+    nsd.fctx.e[lru].ada.learning_rate  = NSD_ML_LR_INIT;
+    nsd.fctx.e[lru].mon.prefetch_ok    = true;
     nsd.fctx.e[lru].meta_ops     = 0;
     nsd.fctx.e[lru].small_io_ops = 0;
     nsd.fctx.e[lru].total_bytes_read = 0;
@@ -915,36 +955,36 @@ static struct nsd_fctx *nsd_fctx_get(u32 file_id, u64 now)
     return &nsd.fctx.e[lru];
 }
 
-static inline u64 nsd_pend_hash(u32 file_id, u32 region)
+static inline __maybe_unused u64 nsd_pend_hash(u32 file_id, u32 region)
 {
     u64 k[2] = { (u64)file_id, (u64)region };
     return siphash(k, sizeof(k), &nsd.hkey);
 }
 
-static inline void nsd_pend_add(u64 h)
+static inline __maybe_unused void nsd_pend_add(u64 h)
 {
-    WRITE_ONCE(nsd.pending[h & NSD_PENDING_MASK], h);
+    WRITE_ONCE(nsd.pending[h & NSD_PENDING_MASK], h);    WRITE_ONCE(nsd.pending_ts[h & NSD_PENDING_MASK], nsd_ns());
 }
 
-static inline bool nsd_pend_check(u64 h)
+static inline __maybe_unused bool nsd_pend_check(u64 h)
 {
     u32 s = (u32)(h & NSD_PENDING_MASK);
     if (READ_ONCE(nsd.pending[s]) == h) {
-        WRITE_ONCE(nsd.pending[s], 0ULL);
+        WRITE_ONCE(nsd.pending[s], 0ULL);        WRITE_ONCE(nsd.pending_ts[s], 0ULL);
         return true;
     }
     return false;
 }
 
-static inline bool nsd_pend_test(u64 h)
+static inline __maybe_unused bool nsd_pend_test(u64 h)
 {
     return READ_ONCE(nsd.pending[h & NSD_PENDING_MASK]) == h;
 }
 
-static void nsd_mon_update(bool correct)
+static __maybe_unused void nsd_mon_update(struct nsd_fctx *ctx, bool correct)
 {
     u32 idx, acc;
-    spin_lock(&nsd.mon_lock);
+    /* no lock - per-fctx */
     idx = nsd.mon.idx % NSD_MON_WINDOW;
     if (nsd.mon.count >= NSD_MON_WINDOW)
         nsd.mon.sum -= nsd.mon.window[idx];
@@ -954,13 +994,13 @@ static void nsd_mon_update(bool correct)
     if (nsd.mon.count < NSD_MON_WINDOW) nsd.mon.count++;
     acc = nsd.mon.count > 0 ? nsd.mon.sum / nsd.mon.count : 500;
     if (acc < NSD_MON_DISABLE && nsd.mon.count >= NSD_MON_WINDOW)
-        nsd.mon.prefetch_ok = false;
+        ctx->mon.prefetch_ok = false;
     else if (acc > NSD_MON_ENABLE)
         nsd.mon.prefetch_ok = true;
-    spin_unlock(&nsd.mon_lock);
+    /* no lock - per-fctx */
 }
 
-static bool nsd_ring_put(struct file *file, loff_t off, size_t size)
+static __maybe_unused bool nsd_ring_put(struct file *file, loff_t off, size_t size)
 {
     struct nsd_pcpu_ring *r = this_cpu_ptr(&nsd_ring);
     u32 p    = (u32)atomic_read(&r->prod);
@@ -981,7 +1021,30 @@ static bool nsd_ring_put(struct file *file, loff_t off, size_t size)
     return true;
 }
 
-static int nsd_kprobe_pre(struct kprobe *p, struct pt_regs *regs)
+static inline __maybe_unused void nsd_track_micro_seq(struct inode *inode, loff_t off, size_t len)
+{
+    struct nsd_pcpu_state *st = this_cpu_ptr(&nsd_cpu_state);
+    u32 pid = current->pid;
+    u32 ino = inode->i_ino;
+
+    if (st->micro_seq_last_inode == ino &&
+        st->micro_seq_last_pid == pid &&
+        off == st->micro_seq_last_offset + st->micro_seq_last_len) {
+        st->micro_seq_hits++;
+        if (st->micro_seq_hits > 3)
+            st->micro_seq_hits = 4;
+    } else {
+        st->micro_seq_hits = 0;
+    }
+
+    st->micro_seq_last_inode = ino;
+    st->micro_seq_last_pid   = pid;
+    st->micro_seq_last_offset = off;
+    st->micro_seq_last_len    = len;
+    st->micro_seq_last_ns     = nsd_ns();
+}
+
+static __maybe_unused int nsd_kprobe_pre(struct kprobe *p, struct pt_regs *regs)
 {
     struct file  *file;
     struct inode *inode;
@@ -1019,8 +1082,20 @@ static int nsd_kprobe_pre(struct kprobe *p, struct pt_regs *regs)
 #endif
 
 
-    if ((atomic64_inc_return(&nsd.st_kprobe) & 1ULL) == 0) {
-        if (!nsd_ring_put(file, off, io_size))
+    if (atomic_read(&nsd.feat_procaware))
+        nsd_track_micro_seq(inode, off, io_size);
+
+    if (true) {
+        atomic64_inc(&nsd.st_kprobe);
+        u64 key = (u64)inode->i_ino ^ (u64)(unsigned long)inode->i_sb;
+        u32 file_id = hash_64(key, NSD_FCTX_BITS);
+        bool skip = READ_ONCE(nsd.skip_kprobe[file_id]) &&
+                    READ_ONCE(nsd.skip_ino[file_id]) == (u64)inode->i_ino;
+        if (skip && nsd_ns() - READ_ONCE(nsd.skip_time[file_id]) > 5ULL * NSEC_PER_SEC) {
+            WRITE_ONCE(nsd.skip_kprobe[file_id], false);
+            skip = false;
+        }
+        if (!skip && !nsd_ring_put(file, off, io_size))
             atomic64_inc(&nsd.st_dropped);
     }
 
@@ -1032,7 +1107,7 @@ static struct kprobe nsd_kp = {
     .pre_handler = nsd_kprobe_pre,
 };
 
-static int nsd_hook_register(void)
+static __maybe_unused int nsd_hook_register(void)
 {
     int ret;
     if (!atomic_read(&nsd.hook_on) || atomic_read(&nsd.hook_reg)) return 0;
@@ -1043,14 +1118,14 @@ static int nsd_hook_register(void)
     return 0;
 }
 
-static void nsd_hook_unregister(void)
+static __maybe_unused void nsd_hook_unregister(void)
 {
     if (!atomic_read(&nsd.hook_reg)) return;
     unregister_kprobe(&nsd_kp);
     atomic_set(&nsd.hook_reg, 0);
 }
 
-static u32 nsd_calc_adaptive_span_mult(enum nsd_strategy strat, struct nsd_fctx *ctx)
+static __maybe_unused u32 nsd_calc_adaptive_span_mult(enum nsd_strategy strat, struct nsd_fctx *ctx)
 {
     u32 mult = NSD_SPAN_MULT_SEQ;
 
@@ -1091,16 +1166,52 @@ static u32 nsd_calc_adaptive_span_mult(enum nsd_strategy strat, struct nsd_fctx 
     return mult;
 }
 
-static void nsd_do_prefetch(struct file *file, u32 file_id,
+enum nsd_workload_type {
+    NSD_WL_UNKNOWN = 0,
+    NSD_WL_SEQUENTIAL,
+    NSD_WL_RANDOM,
+    NSD_WL_PATTERN,
+    NSD_WL_MIXED,
+};
+
+static enum nsd_workload_type nsd_update_workload_state(struct nsd_fctx *ctx, u32 region, u64 now)
+{
+    struct nsd_workload *w = &ctx->wl;
+    u32 seq_r, rpt_r;
+    (void)now;
+
+    if (w->event_count < 32)
+        return NSD_WL_UNKNOWN;
+
+    seq_r = (w->seq_count * 1000) / max(w->event_count, (u32)1);
+    rpt_r = (w->repeat_count * 1000) / max(w->event_count, (u32)1);
+
+    if (seq_r > 800)
+        return NSD_WL_SEQUENTIAL;
+    if (rpt_r > 600)
+        return NSD_WL_PATTERN;
+    if (seq_r < 100 && rpt_r < 100)
+        return NSD_WL_RANDOM;
+    return NSD_WL_MIXED;
+}
+
+static __maybe_unused void nsd_do_prefetch(struct file *file, u32 file_id,
                              u32 region, u32 prev_region,
                              bool has_prev, struct nsd_fctx *ctx)
 {
     u32 r = region;
     u32 depth, d;
+    u32 depth_boost = 0;
     u16 thresh;
     u64 span;
     enum nsd_strategy strat;
 
+
+    if (atomic_read(&nsd.feat_procaware)) {
+        struct nsd_pcpu_state *st = this_cpu_ptr(&nsd_cpu_state);
+        if (st->micro_seq_hits >= 3)
+            depth_boost = 4;
+    }
 
     if (atomic_read(&nsd.feat_stride) && ctx) {
         u32  tmp_r;
@@ -1112,12 +1223,30 @@ static void nsd_do_prefetch(struct file *file, u32 file_id,
 
 
     if (atomic_read(&nsd.observe_only)) return;
+    if (ctx && ctx->disabled && nsd_ns() < ctx->negcache_until)
+        return;
 
 
-    depth  = READ_ONCE(nsd.depth);
+    depth  = ctx ? ctx->depth : READ_ONCE(nsd.depth);
+    if (depth_boost > depth) depth = depth_boost;
+    /* queue depth limit kaldirildi — SSD/HDD qd=32 > 24 olduğu için
+     * depth=1'e zorlanıyordu ve prefetch felç oluyordu */
+    /* if (file->f_inode && file->f_inode->i_sb && file->f_inode->i_sb->s_bdev) {
+        struct request_queue *q = bdev_get_queue(file->f_inode->i_sb->s_bdev);
+        if (q) {
+            unsigned int qd = blk_queue_depth(q);
+            if (qd > 24)
+                depth = 1;
+            else if (qd > 16)
+                depth = min(depth, (u32)2);
+        }
+    } */
+
     thresh = READ_ONCE(nsd.thresh);
-    span   = READ_ONCE(nsd.prefetch_span);
+    span   = ctx ? ctx->prefetch_span : READ_ONCE(nsd.prefetch_span);
     strat  = ctx ? ctx->wl.active : NSD_STRAT_MARKOV;
+    if (strat == NSD_STRAT_NONE)
+        return;
 
 
     int  consecutive_dup = 0;
@@ -1151,7 +1280,10 @@ static void nsd_do_prefetch(struct file *file, u32 file_id,
             len = (u64)coalesce_len * (u64)READ_ONCE(nsd.prefetch_span) * \
                   span_mult;                                             \
         }                                                                 \
-        vfs_fadvise(file, start, len, POSIX_FADV_WILLNEED);              \
+        if (strat == NSD_STRAT_MARKOV || strat == NSD_STRAT_BIGRAM)       \
+            vfs_fadvise(file, start, len, POSIX_FADV_SEQUENTIAL);        \
+        else                                                              \
+            vfs_fadvise(file, start, len, POSIX_FADV_WILLNEED | POSIX_FADV_NOREUSE); \
         if (coalesce_len > 1)                                            \
             atomic64_inc(&nsd.st_coalesced);                             \
         atomic64_inc(&nsd.st_prefetch);                                  \
@@ -1262,7 +1394,7 @@ stride_chain_emit:
 #undef FLUSH_COALESCE
 }
 
-static void nsd_process(struct file *file, loff_t off, size_t size)
+static __maybe_unused void nsd_process(struct file *file, loff_t off, size_t size)
 {
     u32  file_id = nsd_file_id(file);
     u32  region  = nsd_off_to_region(off);
@@ -1281,7 +1413,7 @@ static void nsd_process(struct file *file, loff_t off, size_t size)
 
 
     spin_lock(&nsd.fctx.lock);
-    ctx = nsd_fctx_get(file_id, now);
+    ctx = nsd_fctx_get(file_id, now, file->f_inode);
     spin_unlock(&nsd.fctx.lock);
 
 
@@ -1332,8 +1464,8 @@ static void nsd_process(struct file *file, loff_t off, size_t size)
         u64 ph = nsd_pend_hash(file_id, region);
         if (nsd_pend_check(ph)) {
             atomic64_inc(&nsd.st_correct);
-            nsd_mon_update(true);
-            nsd_adaptive_update(true);
+            nsd_mon_update(ctx, true);
+            nsd_adaptive_update(ctx, true);
 
             ctx->hit_count++;
             if (has_prev)
@@ -1349,8 +1481,24 @@ static void nsd_process(struct file *file, loff_t off, size_t size)
                         ctx->disabled = true;
                     }
                 }
-                nsd_mon_update(false);
-                nsd_adaptive_update(false);
+                if (ctx) {
+                    u32 acc2 = ctx->hit_count * 100 / max(ctx->pf_count, (u32)1);
+                    if (acc2 < 10 && ctx->pf_count > 5) {
+                        ctx->negcache_hits++;
+                        if (ctx->negcache_hits >= 3) {
+                            ctx->negcache_until = nsd_ns() + 10ULL * NSEC_PER_SEC;
+                            ctx->disabled = true;
+                        }
+                    }
+                    if (nsd_ns() > ctx->negcache_until) {
+                        ctx->negcache_until = 0;
+                        ctx->negcache_hits = 0;
+                        ctx->disabled = false;
+                    }
+                }
+
+                nsd_mon_update(ctx, false);
+                nsd_adaptive_update(ctx, false);
             }
         }
     }
@@ -1365,10 +1513,13 @@ static void nsd_process(struct file *file, loff_t off, size_t size)
         nsd_syn_strengthen(nsd_syn_key_bigram(file_id, cs->prev_region, prev_r), region);
 
 
+    if (ctx && ctx->wl.active == NSD_STRAT_NONE)
+        return;
+
     nsd_do_prefetch(file, file_id, region, prev_r, has_prev, ctx);
 }
 
-static int nsd_worker(void *data)
+static __maybe_unused int nsd_worker(void *data)
 {
     int cpu;
     (void)data;
@@ -1417,7 +1568,7 @@ static int nsd_worker(void *data)
     return 0;
 }
 
-static void nsd_drain_rings(void)
+static __maybe_unused void nsd_drain_rings(void)
 {
     int cpu;
     for_each_possible_cpu(cpu) {
@@ -1447,25 +1598,34 @@ static unsigned long nsd_shrink_scan(struct shrinker *s, struct shrink_control *
 
     for (i = 0; i < nsd.syn_buckets && freed < target; i++) {
         struct nsd_syn_bucket *b = &nsd.syn[i];
+        int evict_way = -1;
+        u16 min_weight = U16_MAX;
         spin_lock(&b->lock);
-        for (w = 0; w < NSD_SYN_WAYS && freed < target; w++) {
+        for (w = 0; w < NSD_SYN_WAYS; w++) {
             int d;
             for (d = 0; d < b->ways[w].dst_count; d++) {
-                if (b->ways[w].weight[d] > 0 && b->ways[w].weight[d] < NSD_SHRINK_EVICT_WEIGHT) {
-                    b->ways[w].weight[d] = 0;
-                    freed++;
-                    if (atomic64_read(&nsd.st_syn_active) > 0)
-                        atomic64_dec(&nsd.st_syn_active);
-                    atomic64_inc(&nsd.st_syn_evict);
+                if (b->ways[w].weight[d] > 0 && b->ways[w].weight[d] < min_weight) {
+                    min_weight = b->ways[w].weight[d];
+                    evict_way = w;
                 }
             }
         }
+        if (evict_way >= 0) {
+            int d;
+            for (d = 0; d < b->ways[evict_way].dst_count; d++)
+                b->ways[evict_way].weight[d] = 0;
+            freed++;
+            if (atomic64_read(&nsd.st_syn_active) > 0)
+                atomic64_dec(&nsd.st_syn_active);
+            atomic64_inc(&nsd.st_syn_evict);
+        }
         spin_unlock(&b->lock);
+        if ((i & 0xFF) == 0xFF) cond_resched();
     }
     return freed;
 }
 
-static void nsd_telem_fn(struct work_struct *work)
+static __maybe_unused void nsd_telem_fn(struct work_struct *work)
 {
     u64 c   = atomic64_read(&nsd.st_correct);
     u64 pf  = atomic64_read(&nsd.st_prefetch);
@@ -1473,11 +1633,22 @@ static void nsd_telem_fn(struct work_struct *work)
     u16 hist_acc, rec_acc, lr;
     (void)work;
 
-    spin_lock(&nsd.ada_lock);
-    hist_acc = nsd.ada.historical_acc;
-    rec_acc  = nsd.ada.recent_acc;
-    lr       = nsd.ada.learning_rate;
-    spin_unlock(&nsd.ada_lock);
+    hist_acc = 0; rec_acc = 0; lr = 0;
+    {
+        int _fi;
+        u32 _cnt = 0;
+        spin_lock(&nsd.fctx.lock);
+        for (_fi = 0; _fi < NSD_FCTX_SLOTS; _fi++) {
+            if (nsd.fctx.e[_fi].valid) {
+                hist_acc += nsd.fctx.e[_fi].ada.historical_acc;
+                rec_acc += nsd.fctx.e[_fi].ada.recent_acc;
+                lr += nsd.fctx.e[_fi].ada.learning_rate;
+                _cnt++;
+            }
+        }
+        spin_unlock(&nsd.fctx.lock);
+        if (_cnt) { hist_acc /= _cnt; rec_acc /= _cnt; lr /= _cnt; }
+    }
 
     pr_info("[NSD] ev=%llu pf=%llu hit=%llu%% syn=%llu drop=%llu "
             "bypass=%llu strat_sw=%llu thresh=%u "
@@ -1497,7 +1668,7 @@ static void nsd_telem_fn(struct work_struct *work)
                            msecs_to_jiffies(NSD_TELEM_MS));
 }
 
-static void nsd_waste_track_fn(struct work_struct *work)
+static __maybe_unused void nsd_waste_track_fn(struct work_struct *work)
 {
     u64 now = nsd_ns();
     u32 i;
@@ -1509,9 +1680,9 @@ static void nsd_waste_track_fn(struct work_struct *work)
 
     for (i = 0; i < NSD_PENDING_SLOTS; i++) {
         u64 h = READ_ONCE(nsd.pending[i]);
-        if (h && (now - h) > expire_ns) {
+        if (h && (now - READ_ONCE(nsd.pending_ts[i])) > expire_ns) {
             expired++;
-            WRITE_ONCE(nsd.pending[i], 0ULL);
+            WRITE_ONCE(nsd.pending[i], 0ULL);            WRITE_ONCE(nsd.pending_ts[i], 0ULL);
         }
     }
     if (expired)
@@ -1549,7 +1720,7 @@ resched:
 # define NSD_BDEV_CLOSE(ref) blkdev_put((struct block_device *)(ref), FMODE_READ)
 #endif
 
-static void nsd_auto_tune(void)
+static __maybe_unused void nsd_auto_tune(void)
 {
 
     static const dev_t cands[] = {
@@ -1632,7 +1803,7 @@ static void nsd_auto_tune(void)
             (unsigned long long)(nsd.prefetch_span >> 10));
 }
 
-static ssize_t stats_show(struct kobject *k, struct kobj_attribute *a, char *buf)
+static __maybe_unused ssize_t stats_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     ssize_t len;
     u64  p  = atomic64_read(&nsd.st_predictions);
@@ -1645,15 +1816,25 @@ static ssize_t stats_show(struct kobject *k, struct kobj_attribute *a, char *buf
     u16  hist_acc, rec_acc, lr;
     (void)k; (void)a;
 
-    spin_lock(&nsd.mon_lock);
-    mok = nsd.mon.prefetch_ok;
-    spin_unlock(&nsd.mon_lock);
-
-    spin_lock(&nsd.ada_lock);
-    hist_acc = nsd.ada.historical_acc;
-    rec_acc  = nsd.ada.recent_acc;
-    lr       = nsd.ada.learning_rate;
-    spin_unlock(&nsd.ada_lock);
+    mok = true;
+    hist_acc = 0; rec_acc = 0; lr = 0;
+    {
+        int _fi;
+        u32 _cnt = 0;
+        spin_lock(&nsd.fctx.lock);
+        for (_fi = 0; _fi < NSD_FCTX_SLOTS; _fi++) {
+            if (nsd.fctx.e[_fi].valid) {
+                hist_acc += nsd.fctx.e[_fi].ada.historical_acc;
+                rec_acc += nsd.fctx.e[_fi].ada.recent_acc;
+                lr += nsd.fctx.e[_fi].ada.learning_rate;
+                if (!nsd.fctx.e[_fi].mon.prefetch_ok)
+                    mok = false;
+                _cnt++;
+            }
+        }
+        spin_unlock(&nsd.fctx.lock);
+        if (_cnt) { hist_acc /= _cnt; rec_acc /= _cnt; lr /= _cnt; }
+    }
 
     len = sprintf(buf,
         "version:%s\n"
@@ -1706,7 +1887,7 @@ static ssize_t stats_show(struct kobject *k, struct kobj_attribute *a, char *buf
     return len;
 }
 
-static ssize_t fctx_debug_show(struct kobject *k, struct kobj_attribute *a, char *buf)
+static __maybe_unused ssize_t fctx_debug_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     ssize_t len = 0;
     int i;
@@ -1717,21 +1898,25 @@ static ssize_t fctx_debug_show(struct kobject *k, struct kobj_attribute *a, char
         struct nsd_fctx *fc = &nsd.fctx.e[i];
         if (!fc->valid) continue;
         len += sprintf(buf + len,
-            "fctx[%d]: file_id=%u read_count=%llu predictions=%u correct=%u disabled=%d\n",
+            "fctx[%d]: file_id=%u read_count=%llu pred=%u cor=%u depth=%u thresh=%u span=%llu dis=%d hist=%u rec=%u lr=%u\n",
             i, fc->file_id,
             (unsigned long long)fc->read_count,
-            fc->pf_count, fc->hit_count, fc->disabled);
+            fc->pf_count, fc->hit_count,
+            fc->depth, fc->thresh,
+            (unsigned long long)fc->prefetch_span,
+            fc->disabled,
+            fc->ada.historical_acc, fc->ada.recent_acc, fc->ada.learning_rate);
     }
     spin_unlock(&nsd.fctx.lock);
     return len;
 }
 
-static ssize_t hook_enable_show(struct kobject *k, struct kobj_attribute *a, char *buf)
+static __maybe_unused ssize_t hook_enable_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     (void)k; (void)a;
     return sprintf(buf, "%d\n", atomic_read(&nsd.hook_on));
 }
-static ssize_t hook_enable_store(struct kobject *k, struct kobj_attribute *a,
+static __maybe_unused ssize_t hook_enable_store(struct kobject *k, struct kobj_attribute *a,
                                   const char *buf, size_t n)
 {
     unsigned v;
@@ -1743,12 +1928,12 @@ static ssize_t hook_enable_store(struct kobject *k, struct kobj_attribute *a,
     return n;
 }
 
-static ssize_t observe_only_show(struct kobject *k, struct kobj_attribute *a, char *buf)
+static __maybe_unused ssize_t observe_only_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     (void)k; (void)a;
     return sprintf(buf, "%d\n", atomic_read(&nsd.observe_only));
 }
-static ssize_t observe_only_store(struct kobject *k, struct kobj_attribute *a,
+static __maybe_unused ssize_t observe_only_store(struct kobject *k, struct kobj_attribute *a,
                                    const char *buf, size_t n)
 {
     unsigned v;
@@ -1758,7 +1943,7 @@ static ssize_t observe_only_store(struct kobject *k, struct kobj_attribute *a,
     return n;
 }
 
-static ssize_t mode_show(struct kobject *k, struct kobj_attribute *a, char *buf)
+static __maybe_unused ssize_t mode_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     enum nsd_mode m = READ_ONCE(nsd_mode);
     const char *s;
@@ -1772,7 +1957,7 @@ static ssize_t mode_show(struct kobject *k, struct kobj_attribute *a, char *buf)
     return sprintf(buf, "%s\n", s);
 }
 
-static ssize_t mode_store(struct kobject *k, struct kobj_attribute *a,
+static __maybe_unused ssize_t mode_store(struct kobject *k, struct kobj_attribute *a,
                           const char *buf, size_t n)
 {
     enum nsd_mode new_mode;
@@ -1816,12 +2001,12 @@ static ssize_t mode_store(struct kobject *k, struct kobj_attribute *a,
     return orig_n;
 }
 
-static ssize_t depth_show(struct kobject *k, struct kobj_attribute *a, char *buf)
+static __maybe_unused ssize_t depth_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     (void)k; (void)a;
     return sprintf(buf, "%u\n", READ_ONCE(nsd.depth));
 }
-static ssize_t depth_store(struct kobject *k, struct kobj_attribute *a,
+static __maybe_unused ssize_t depth_store(struct kobject *k, struct kobj_attribute *a,
                             const char *buf, size_t n)
 {
     unsigned v;
@@ -1831,12 +2016,12 @@ static ssize_t depth_store(struct kobject *k, struct kobj_attribute *a,
     return n;
 }
 
-static ssize_t thresh_show(struct kobject *k, struct kobj_attribute *a, char *buf)
+static __maybe_unused ssize_t thresh_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     (void)k; (void)a;
     return sprintf(buf, "%u\n", READ_ONCE(nsd.thresh));
 }
-static ssize_t thresh_store(struct kobject *k, struct kobj_attribute *a,
+static __maybe_unused ssize_t thresh_store(struct kobject *k, struct kobj_attribute *a,
                              const char *buf, size_t n)
 {
     unsigned v;
@@ -1846,13 +2031,13 @@ static ssize_t thresh_store(struct kobject *k, struct kobj_attribute *a,
     return n;
 }
 
-static ssize_t dev_class_show(struct kobject *k, struct kobj_attribute *a, char *buf)
+static __maybe_unused ssize_t dev_class_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     (void)k; (void)a;
     return sprintf(buf, "%s\n", nsd_dev_names[READ_ONCE(nsd.dev_class)]);
 }
 
-static ssize_t dev_class_store(struct kobject *k, struct kobj_attribute *a,
+static __maybe_unused ssize_t dev_class_store(struct kobject *k, struct kobj_attribute *a,
                                 const char *buf, size_t n)
 {
     enum nsd_dev_class new_class;
@@ -1905,7 +2090,7 @@ static ssize_t dev_class_store(struct kobject *k, struct kobj_attribute *a,
     return orig_n;
 }
 
-static ssize_t features_show(struct kobject *k, struct kobj_attribute *a, char *buf)
+static __maybe_unused ssize_t features_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     (void)k; (void)a;
     return sprintf(buf, "stride=%d autothresh=%d fine_decay=%d procaware=%d waste_track=%d\n",
@@ -1916,7 +2101,7 @@ static ssize_t features_show(struct kobject *k, struct kobj_attribute *a, char *
                    atomic_read(&nsd.feat_waste_track));
 }
 
-static ssize_t features_store(struct kobject *k, struct kobj_attribute *a,
+static __maybe_unused ssize_t features_store(struct kobject *k, struct kobj_attribute *a,
                                const char *buf, size_t n)
 {
     unsigned v;
@@ -2009,6 +2194,9 @@ static int __init nsd_init(void)
 
 
     atomic64_set(&nsd.st_kprobe, 0);
+    memset(nsd.skip_kprobe, 0, sizeof(nsd.skip_kprobe));
+    memset(nsd.skip_ino, 0, sizeof(nsd.skip_ino));
+    memset(nsd.skip_time, 0, sizeof(nsd.skip_time));
 
     nsd.worker = kthread_create(nsd_worker, NULL, "nsd_brain");
     if (IS_ERR(nsd.worker)) {
