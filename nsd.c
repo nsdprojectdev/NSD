@@ -81,6 +81,9 @@
 #define NSD_W_OBSERVE     300
 #define NSD_W_HIT         150
 #define NSD_W_PENALTY   150
+#define NSD_PEND_NONE      0
+#define NSD_PEND_SYNAPTIC  1
+#define NSD_PEND_STRIDE    2
 #define NSD_W_DECAY_MS    300000
 
 #define NSD_DECAY_RUNS_MIN        6
@@ -312,6 +315,7 @@ static struct {
     u64 pending_ts[NSD_PENDING_SLOTS];
     u32 pending_way[NSD_PENDING_SLOTS];
     u32 pending_dst[NSD_PENDING_SLOTS];
+    u32 pending_kind[NSD_PENDING_SLOTS];
     bool skip_kprobe[NSD_FCTX_SLOTS];
     u64 skip_ino[NSD_FCTX_SLOTS];
     u64 skip_time[NSD_FCTX_SLOTS];
@@ -359,6 +363,8 @@ static struct {
     atomic64_t st_disabled;
     atomic64_t st_decay;
     atomic64_t st_waste_expired;
+    atomic64_t st_pending_overwrite;
+    atomic64_t st_pending_skip;
 
     atomic64_t st_syn_active;
     atomic64_t st_syn_evict;
@@ -394,6 +400,17 @@ static struct {
 };
 
 static enum nsd_mode nsd_mode = NSD_MODE_NORMAL;
+/* module parameters */
+static bool param_waste_track = false;
+module_param(param_waste_track, bool, 0644);
+MODULE_PARM_DESC(param_waste_track, "Enable waste_track feature");
+static bool param_observe_only = false;
+module_param(param_observe_only, bool, 0644);
+MODULE_PARM_DESC(param_observe_only, "Start in observe-only mode");
+static bool param_penalty = true;
+module_param(param_penalty, bool, 0644);
+MODULE_PARM_DESC(param_penalty, "Enable penalty weaken on waste");
+
 
 static struct kobject *nsd_kobj;
 
@@ -985,16 +1002,19 @@ static inline __maybe_unused u64 nsd_pend_hash(u32 file_id, u32 region)
     return siphash(k, sizeof(k), &nsd.hkey);
 }
 
-static inline __maybe_unused void nsd_pend_add(u64 h, u32 way, u32 dst)
+static inline __maybe_unused void nsd_pend_add(u64 h, u32 way, u32 dst, u32 kind)
 {
-    WRITE_ONCE(nsd.pending[h & NSD_PENDING_MASK], h);    WRITE_ONCE(nsd.pending_ts[h & NSD_PENDING_MASK], nsd_ns());    WRITE_ONCE(nsd.pending_way[h & NSD_PENDING_MASK], way);    WRITE_ONCE(nsd.pending_dst[h & NSD_PENDING_MASK], dst);
+    u32 s = h & NSD_PENDING_MASK;
+    if (READ_ONCE(nsd.pending[s]) && READ_ONCE(nsd.pending[s]) != h)
+        atomic64_inc(&nsd.st_pending_overwrite);
+    WRITE_ONCE(nsd.pending[s], h);    WRITE_ONCE(nsd.pending_ts[s], nsd_ns());    WRITE_ONCE(nsd.pending_way[s], way);    WRITE_ONCE(nsd.pending_dst[s], dst);    WRITE_ONCE(nsd.pending_kind[s], kind);
 }
 
 static inline __maybe_unused bool nsd_pend_check(u64 h)
 {
     u32 s = (u32)(h & NSD_PENDING_MASK);
     if (READ_ONCE(nsd.pending[s]) == h) {
-        WRITE_ONCE(nsd.pending[s], 0ULL);        WRITE_ONCE(nsd.pending_ts[s], 0ULL);        WRITE_ONCE(nsd.pending_way[s], 0);        WRITE_ONCE(nsd.pending_dst[s], 0);
+        WRITE_ONCE(nsd.pending[s], 0ULL);        WRITE_ONCE(nsd.pending_ts[s], 0ULL);        WRITE_ONCE(nsd.pending_way[s], 0);        WRITE_ONCE(nsd.pending_dst[s], 0);        WRITE_ONCE(nsd.pending_kind[s], 0);
         return true;
     }
     return false;
@@ -1002,7 +1022,11 @@ static inline __maybe_unused bool nsd_pend_check(u64 h)
 
 static inline __maybe_unused bool nsd_pend_test(u64 h)
 {
-    return READ_ONCE(nsd.pending[h & NSD_PENDING_MASK]) == h;
+    if (READ_ONCE(nsd.pending[h & NSD_PENDING_MASK]) == h) {
+        atomic64_inc(&nsd.st_pending_skip);
+        return true;
+    }
+    return false;
 }
 
 static __maybe_unused void nsd_mon_update(struct nsd_fctx *ctx, bool correct)
@@ -1400,8 +1424,16 @@ stride_chain_emit:
 
 
         {
-            u32 bw = (pred_way >= 0 && pred_key != 0) ? (((u32)(pred_key & nsd.syn_mask) << 8) | ((u32)pred_way + 1)) : 0;
-            nsd_pend_add(ph, bw, next_r);
+        u32 pend_kind = NSD_PEND_NONE;
+        u32 pend_way  = 0;
+        if (use_stride_chain) {
+            pend_kind = NSD_PEND_STRIDE;
+            pend_way  = file_id;
+        } else if (pred_way >= 0 && pred_key != 0) {
+            pend_kind = NSD_PEND_SYNAPTIC;
+            pend_way  = ((u32)(pred_key & nsd.syn_mask) << 8) | ((u32)pred_way + 1);
+        }
+        nsd_pend_add(ph, pend_way, next_r, pend_kind);
         }
 
 
@@ -1713,12 +1745,26 @@ static __maybe_unused void nsd_waste_track_fn(struct work_struct *work)
         if (h && (now - READ_ONCE(nsd.pending_ts[i])) > expire_ns) {
             expired++;
             {
-                u32 bw  = READ_ONCE(nsd.pending_way[i]);
-                u32 dst = READ_ONCE(nsd.pending_dst[i]);
-                if (bw) nsd_syn_weaken(bw, dst);
+                    u32 kind = READ_ONCE(nsd.pending_kind[i]);
+                    u32 bw   = READ_ONCE(nsd.pending_way[i]);
+                    u32 dst  = READ_ONCE(nsd.pending_dst[i]);
+                    if (kind == NSD_PEND_SYNAPTIC && bw) {
+                        if (param_penalty) nsd_syn_weaken(bw, dst);
+                    } else if (kind == NSD_PEND_STRIDE) {
+                        u32 fid = bw;
+                        struct nsd_fctx *ctx = NULL;
+                        int k;
+                        for (k = 0; k < NSD_FCTX_SLOTS; k++) {
+                            if (nsd.fctx.e[k].valid && nsd.fctx.e[k].file_id == fid) {
+                                ctx = &nsd.fctx.e[k];
+                                break;
+                            }
+                        }
+                        if (ctx) ctx->stride_count = 0;
+                    }
             }
             WRITE_ONCE(nsd.pending[i], 0ULL);            WRITE_ONCE(nsd.pending_ts[i], 0ULL);
-            WRITE_ONCE(nsd.pending_way[i], 0);            WRITE_ONCE(nsd.pending_dst[i], 0);
+            WRITE_ONCE(nsd.pending_way[i], 0);            WRITE_ONCE(nsd.pending_dst[i], 0);            WRITE_ONCE(nsd.pending_kind[i], 0);
         }
     }
     if (expired)
@@ -1846,7 +1892,10 @@ static __maybe_unused ssize_t stats_show(struct kobject *k, struct kobj_attribut
     u64  c  = atomic64_read(&nsd.st_correct);
     u64  pf = atomic64_read(&nsd.st_prefetch);
 
+    u64  skip = atomic64_read(&nsd.st_pending_skip);
+    u64  pnew = (skip < p) ? (p - skip) : 0;
     u64  hit = (p  > 0) ? (c * 100 / p)  : 0;
+    u64  hit_real = (pnew > 0) ? (c * 100 / pnew) : 0;
     u64  amp = (pf > 0) ? (c * 100 / pf) : 0;
     bool mok;
     u16  hist_acc, rec_acc, lr;
@@ -1879,13 +1928,13 @@ static __maybe_unused ssize_t stats_show(struct kobject *k, struct kobj_attribut
         "dev_class:%s\n"
         "depth:%u\nthresh:%u\nregion_kb:%llu\nspan_kb:%llu\n"
         "events:%llu\nkprobe:%llu\nlearned:%llu\npredictions:%llu\n"
-        "prefetch_sent:%llu\ncorrect:%llu\nhit_rate:%llu%%\nprefetch_amp:%llu%%\n"
+        "prefetch_sent:%llu\ncorrect:%llu\nhit_rate:%llu%%\nhit_rate_real:%llu%%\nprefetch_amp:%llu%%\n"
         "synapses:%llu\nevicted:%llu\ndropped:%llu\n"
         "seq_bypass:%llu\nstrat_switch:%llu\nautothresh_adj:%llu\n"
         "stride_predictions:%llu\nstride_chain:%llu\n"
         "hist_acc:%u\nrec_acc:%u\nlearning_rate:%u\n"
         "decay_runs:%llu\ndisabled:%llu\ncoalesced:%llu\nmonitor_ok:%d\n"
-        "waste_expired:%llu\n",
+        "pending_overwrite:%llu\n""pending_skip:%llu\n""waste_expired:%llu\n",
         NSD_VERSION,
         atomic_read(&nsd.running),
         atomic_read(&nsd.hook_reg),
@@ -1904,6 +1953,7 @@ static __maybe_unused ssize_t stats_show(struct kobject *k, struct kobj_attribut
         (unsigned long long)pf,
         (unsigned long long)c,
         (unsigned long long)hit,
+        (unsigned long long)hit_real,
         (unsigned long long)amp,
         (unsigned long long)atomic64_read(&nsd.st_syn_active),
         (unsigned long long)atomic64_read(&nsd.st_syn_evict),
@@ -1918,6 +1968,8 @@ static __maybe_unused ssize_t stats_show(struct kobject *k, struct kobj_attribut
         (unsigned long long)atomic64_read(&nsd.st_disabled),
         (unsigned long long)atomic64_read(&nsd.st_coalesced),
         (unsigned)mok,
+        (unsigned long long)atomic64_read(&nsd.st_pending_overwrite),
+        (unsigned long long)atomic64_read(&nsd.st_pending_skip),
         (unsigned long long)atomic64_read(&nsd.st_waste_expired));
 
     return len;
@@ -2227,6 +2279,11 @@ static int __init nsd_init(void)
     }
 
     atomic_set(&nsd.running, 1);
+    if (param_waste_track)
+        atomic_set(&nsd.feat_waste_track, 1);
+    if (param_observe_only)
+        atomic_set(&nsd.observe_only, 1);
+
 
 
     atomic64_set(&nsd.st_kprobe, 0);
