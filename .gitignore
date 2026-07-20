@@ -16,3 +16,8 @@ modules.order
 
 # Temp
 *.tmp
+*.bak
+*.orig
+*.rej
+*.cmd
+nsd.mod
