@@ -19,7 +19,7 @@
 #include <linux/workqueue.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
-#include <linux/kprobes.h>
+#include <linux/fprobe.h>
 #include <linux/percpu.h>
 #include <linux/jiffies.h>
 #include <linux/sched.h>
@@ -1092,27 +1092,20 @@ static inline __maybe_unused void nsd_track_micro_seq(struct inode *inode, loff_
     st->micro_seq_last_ns     = nsd_ns();
 }
 
-static __maybe_unused int nsd_kprobe_pre(struct kprobe *p, struct pt_regs *regs)
+static __maybe_unused int nsd_fprobe_entry(struct fprobe *fp, unsigned long entry_ip,
+                             unsigned long ret_ip, struct ftrace_regs *fregs,
+                             void *entry_data)
 {
     struct file  *file;
     struct inode *inode;
     loff_t       *pos_ptr, off;
-    (void)p;
+    (void)fp; (void)entry_ip; (void)ret_ip; (void)entry_data;
 
-#if defined(CONFIG_X86_64)
-    file    = (struct file *)regs->di;
-    pos_ptr = (loff_t *)regs->cx;
+    file    = (struct file *)ftrace_regs_get_argument(fregs, 0);
+    pos_ptr = (loff_t *)ftrace_regs_get_argument(fregs, 3);
+    size_t io_size = (size_t)ftrace_regs_get_argument(fregs, 2);
 
-    if (regs->dx < 4096) return 0;
-#elif defined(CONFIG_ARM64)
-    file    = (struct file *)regs->regs[0];
-    pos_ptr = (loff_t *)regs->regs[3];
-
-    if (regs->regs[2] < 4096) return 0;
-#else
-    return 0;
-#endif
-
+    if (io_size < 4096) return 0;
     if (!file || !pos_ptr) return 0;
 
     inode = file->f_inode;
@@ -1121,14 +1114,6 @@ static __maybe_unused int nsd_kprobe_pre(struct kprobe *p, struct pt_regs *regs)
 
     off = *pos_ptr;
     if (off < 0) return 0;
-
-    size_t io_size = 0;
-#if defined(CONFIG_X86_64)
-    io_size = (size_t)regs->dx;
-#elif defined(CONFIG_ARM64)
-    io_size = (size_t)regs->regs[2];
-#endif
-
 
     if (atomic_read(&nsd.feat_procaware))
         nsd_track_micro_seq(inode, off, io_size);
@@ -1150,26 +1135,28 @@ static __maybe_unused int nsd_kprobe_pre(struct kprobe *p, struct pt_regs *regs)
     return 0;
 }
 
-static struct kprobe nsd_kp = {
-    .symbol_name = "vfs_read",
-    .pre_handler = nsd_kprobe_pre,
+static struct fprobe nsd_fp = {
+    .entry_handler = nsd_fprobe_entry,
 };
 
 static __maybe_unused int nsd_hook_register(void)
 {
     int ret;
     if (!atomic_read(&nsd.hook_on) || atomic_read(&nsd.hook_reg)) return 0;
-    ret = register_kprobe(&nsd_kp);
+    {
+        const char *syms[] = { "vfs_read" };
+        ret = register_fprobe_syms(&nsd_fp, syms, 1);
+    }
     if (ret) return ret;
     atomic_set(&nsd.hook_reg, 1);
-    pr_info("NSD: vfs_read kprobe active\n");
+    pr_info("NSD: vfs_read fprobe active\n");
     return 0;
 }
 
 static __maybe_unused void nsd_hook_unregister(void)
 {
     if (!atomic_read(&nsd.hook_reg)) return;
-    unregister_kprobe(&nsd_kp);
+    unregister_fprobe(&nsd_fp);
     atomic_set(&nsd.hook_reg, 0);
 }
 
