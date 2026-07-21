@@ -1241,6 +1241,19 @@ static __maybe_unused void nsd_do_prefetch(struct file *file, u32 file_id,
     u64 span;
     enum nsd_strategy strat;
 
+    /* SSD stratejik optimizasyon #1: seq bypass (refined)
+     * Stabil stride (d0==d1==d2, 3+ tekrar) ve ileri yönlü (d0>0)
+     * ve makul aralikta (d0<=256, ~1MB) ise kernel readahead devreye girer.
+     * Sadece MARKOV/SEQ stratejilerinde; FREQ_RECENCY'de prefetch anlamlı. */
+    if (ctx && ctx->stride_count >= 3 && ctx->wl.active != NSD_STRAT_FREQ_RECENCY) {
+        s32 d0 = ctx->stride_deltas[0];
+        s32 d1 = ctx->stride_deltas[1];
+        s32 d2 = ctx->stride_deltas[2];
+        if (d0 > 0 && d0 <= 256 && d0 == d1 && d1 == d2) {
+            atomic64_inc(&nsd.st_seq_bypass);
+            return;
+        }
+    }
 
     if (atomic_read(&nsd.feat_procaware)) {
         struct nsd_pcpu_state *st = this_cpu_ptr(&nsd_cpu_state);
