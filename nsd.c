@@ -1261,12 +1261,16 @@ static __maybe_unused void nsd_do_prefetch(struct file *file, u32 file_id,
             depth_boost = 4;
     }
 
+    /* Phase 5: stride_predict bir kez çağr, sonucu sakla */
+    bool stride_found_early = false;
+    u32  stride_next_r = 0;
+    u16  stride_w      = 0;
+    s32  stride_delta_early = 0;
     if (atomic_read(&nsd.feat_stride) && ctx) {
-        u32  tmp_r;
-        u16  tmp_w;
-        s32  tmp_d;
-        if (nsd_stride_predict(ctx, r, &tmp_r, &tmp_w, &tmp_d))
+        if (nsd_stride_predict(ctx, r, &stride_next_r, &stride_w, &stride_delta_early)) {
             atomic64_inc(&nsd.st_stride_predictions);
+            stride_found_early = true;
+        }
     }
 
 
@@ -1369,9 +1373,12 @@ static __maybe_unused void nsd_do_prefetch(struct file *file, u32 file_id,
         }
 
 
-        if (atomic_read(&nsd.feat_stride) && strat != NSD_STRAT_NONE &&
-            nsd_stride_predict(ctx, r, &next_r, &w, &stride_delta)) {
-            found = true;
+        /* Phase 5: İlk çağrı sonucunu kullan, tekrar çağırma */
+        if (stride_found_early && strat != NSD_STRAT_NONE) {
+            next_r      = stride_next_r;
+            w           = stride_w;
+            stride_delta = stride_delta_early;
+            found       = true;
             atomic64_inc(&nsd.st_stride_predictions);
 
             if (stride_delta != 0) {
