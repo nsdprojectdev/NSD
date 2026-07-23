@@ -34,9 +34,12 @@ vfs_read (kprobe) → per-CPU ring → worker thread → Markov/Bigram/Stride/Fr
 
 | Device | Workload | Gain |
 |--------|----------|------|
-| **SSD** | Sequential 64K | **+20.5%** |
+| **SSD** | Sequential 64K (fio) | **+20.5%** |
+| **SSD** | SQLite Full Table Scan (4GB) | **+18.0%** |
 | **HDD** | Sequential 64K | −4% to 0% (neutral) |
 | **HDD** | Random 4K | ~0% |
+
+See [BENCHMARKS.md](BENCHMARKS.md) for detailed methodology and raw results.
 
 ## Design
 
