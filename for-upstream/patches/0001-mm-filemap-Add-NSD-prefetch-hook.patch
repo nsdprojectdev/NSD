@@ -4,11 +4,10 @@ Subject: [PATCH 1/4] mm/filemap: Add NSD prefetch hook point
 
 Add a single function call in filemap_read() to notify the NSD
 prefetcher of I/O events. This allows NSD to learn access patterns
-and issue proactive vfs_fadvise(WILLNEED) calls.
+and issue proactive page_cache_sync_readahead() calls.
 
 The hook is protected by CONFIG_NSD and compiles to nothing when NSD
-is disabled. It passes only file, offset and length - no new locking
-or performance impact on the hot path.
+is disabled.
 
 Signed-off-by: Ayhan Aydin <nsd.project.dev@gmail.com>
 ---
@@ -26,10 +25,11 @@ index 12345678..1234abcd 100644
 +#include <linux/nsd.h>
  #include <asm/pgalloc.h>
  #include <asm/tlb.h>
- @@ -2641,6 +2642,10 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+
+@@ -2641,6 +2642,10 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
  	if (!count)
  		goto out;
- 
+
 +	if (IS_ENABLED(CONFIG_NSD))
 +		nsd_notify_read(iocb->ki_filp, iocb->ki_pos,
 +				iov_iter_count(iter));
@@ -37,5 +37,3 @@ index 12345678..1234abcd 100644
  	already_read = 0;
  	if (!iov_iter_count(iter))
  		goto out;
--- 
-2.43.0

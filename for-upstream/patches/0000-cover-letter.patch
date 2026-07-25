@@ -6,7 +6,7 @@ Hello,
 
 This RFC introduces NSD (Neural Storage Driver), a learning prefetcher
 for the kernel page cache. NSD monitors I/O patterns via a hook in
-filemap_read() and prefetches pages ahead of applications.
+filemap_read() and prefetches pages using page_cache_sync_readahead().
 
 Background
 ==========
@@ -33,20 +33,21 @@ The hook in filemap_read() calls nsd_notify_read(), which:
 1. Records the access in a per-CPU ring buffer
 2. Updates the synaptic transition table
 3. Detects stride patterns
-4. Issues vfs_fadvise(WILLNEED) for predicted regions
+4. Issues page_cache_sync_readahead() for predicted pages
 
 The module exposes /sys/kernel/nsd/ and supports runtime disable.
 
-Patch Summary
-=============
-  PATCH 1/4: mm/filemap: Add NSD prefetch hook (9 lines added)
-  PATCH 2/4: nsd: Core prediction engine (new files under fs/nsd/)
-  PATCH 3/4: nsd: Kconfig and build integration
-  PATCH 4/4: Documentation: NSD docs
+Current Status
+==============
+- Module compiles cleanly (checkpatch --strict: 0 ERROR, 0 CHECK)
+- Tested on x86_64 Ubuntu 24.04 with kernel 7.0.0-28-generic
+- Needs full kernel build with filemap.c hook for end-to-end test
 
 Questions for reviewers:
-- Is filemap_read() the right hook point?
-- Should prefetch use vfs_fadvise or direct ra_state manipulation?
-- How to handle CONFIG_NSD=m vs =y for symbol export?
+- Is filemap_read() the right hook point, or should we hook deeper
+  (e.g., filemap_fault for mmap support)?
+- Should prefetch use page_cache_sync_readahead or direct ra_state
+  manipulation via ra_alloc_folio?
+- How to handle the CONFIG_NSD=m vs =y for symbol export?
 
 Signed-off-by: Ayhan Aydin <nsd.project.dev@gmail.com>
