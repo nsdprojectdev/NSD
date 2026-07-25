@@ -1,0 +1,14 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ayhan Aydin <nsd.project.dev@gmail.com>
+Date: Sat, 25 Jul 2026 20:02:00 +0300
+Subject: [PATCH 3/3] Documentation: Add NSD filesystem documentation
+
+Add initial documentation for the Neural Storage Driver.
+
+Signed-off-by: Ayhan Aydin <nsd.project.dev@gmail.com>
+---
+ Documentation/filesystems/nsd.rst | 77 +++++++++++++++++++++++++++++++
+ MAINTAINERS                       |  8 ++++
+ 2 files changed, 85 insertions(+)
+ create mode 100644 Documentation/filesystems/nsd.rst
+ create mode 100644 MAINTAINERS

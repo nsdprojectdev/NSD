@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ayhan Aydin <nsd.project.dev@gmail.com>
+To: linux-kernel@vger.kernel.org, linux-mm@kvack.org
+Cc: Ayhan Aydin <nsd.project.dev@gmail.com>
+Subject: [RFC PATCH 0/3] Neural Storage Driver - learning page cache prefetcher
+
+Hello,
+
+This RFC introduces NSD (Neural Storage Driver), a learning prefetcher
+for the Linux kernel page cache. NSD monitors I/O patterns via a hook
+in filemap_read() and prefetches pages using page_cache_sync_readahead().
+
+Background
+==========
+The kernel existing readahead uses a fixed-window approach that works
+well for purely sequential access. NSD builds on this by learning
+access patterns at 4KB region granularity using a synaptic Markov chain:
+
+  - Records transitions between file regions
+  - Detects sequential strides of arbitrary length
+  - Issues page_cache_sync_readahead() for predicted pages
+  - Achieves 98% real hit rate on prefetched pages (SSD)
+
+Performance (x86_64, SATA SSD, kernel 7.0.0)
+=============================================
+  SQLite FTS (4GB table):  -18.8% query time
+  Sequential 64K buffered: +22.6% throughput
+  Random 4K buffered:      +1.1% (noise)
+
+Key Question
+============
+Is this approach suitable for the Linux readahead infrastructure?
+I would like to hear your opinions on the architecture.
+
+The module currently hooks filemap_read() and issues prefetch via
+page_cache_sync_readahead(). Would a deeper integration with the
+existing ra_state / file_ra_struct be preferred? Should we extend
+file_ra_struct to accommodate pattern history, or keep the predictor
+as a separate subsystem?
+
+Patch Summary
+=============
+  1/3: mm/filemap: Add NSD prefetch hook point (+5 lines)
+  2/3: nsd: Core prediction engine (fs/nsd/, ~480 lines)
+  3/3: Documentation: Add NSD filesystem documentation
+
+Signed-off-by: Ayhan Aydin <nsd.project.dev@gmail.com>
+---
