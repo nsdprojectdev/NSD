@@ -1,0 +1,16 @@
+config NSD
+	tristate "Neural Storage Driver (NSD) - learning prefetcher"
+	depends on MMU
+	help
+	  NSD is a learning prefetcher that monitors I/O patterns via a hook
+	  in the kernel page cache read path and prefetches pages using
+	  vfs_fadvise(WILLNEED).
+
+	  It builds a synaptic Markov chain model of access patterns at
+	  4KB region granularity, detecting sequential strides, repeating
+	  patterns, and learned transitions.
+
+	  When loaded, NSD adds a small hook in filemap_read() that
+	  compiles to a no-op when NSD is disabled.
+
+	  To compile as a module: M, leave blank to disable.

@@ -1,0 +1,7 @@
+NEURAL STORAGE DRIVER (NSD)
+M:	Ayhan Aydin <nsd.project.dev@gmail.com>
+L:	linux-mm@kvack.org
+S:	Maintained
+F:	fs/nsd/
+F:	include/linux/nsd.h
+F:	Documentation/filesystems/nsd.rst

@@ -1,0 +1,52 @@
+From: Ayhan Aydin <nsd.project.dev@gmail.com>
+Date: Sat, 25 Jul 2026 21:00:00 +0300
+Subject: [RFC PATCH 0/4] Neural Storage Driver - learning prefetcher
+
+Hello,
+
+This RFC introduces NSD (Neural Storage Driver), a learning prefetcher
+for the kernel page cache. NSD monitors I/O patterns via a hook in
+filemap_read() and prefetches pages ahead of applications.
+
+Background
+==========
+The kernel readahead uses a fixed-window approach. NSD builds on this
+by learning access patterns at 4KB region granularity using a synaptic
+Markov chain:
+- Records transitions between file regions
+- Detects sequential strides of arbitrary length
+- Issues speculative prefetch based on learned patterns
+- Achieves 98% real hit rate on prefetched pages
+
+Performance
+===========
+Benchmarked on x86_64, SATA SSD, kernel 7.0.0:
+
+  SQLite FTS (4GB table):  -18.8% query time
+  Sequential 64K buffered: +22.6% throughput
+  Random 4K buffered:      +1.1% (noise)
+  Read latency:            130us (no regression)
+
+Architecture
+============
+The hook in filemap_read() calls nsd_notify_read(), which:
+1. Records the access in a per-CPU ring buffer
+2. Updates the synaptic transition table
+3. Detects stride patterns
+4. Issues vfs_fadvise(WILLNEED) for predicted regions
+
+The module exposes /sys/kernel/nsd/ and supports runtime disable.
+
+Patch Summary
+=============
+  PATCH 1/4: mm/filemap: Add NSD prefetch hook (9 lines added)
+  PATCH 2/4: nsd: Core prediction engine (new files under fs/nsd/)
+  PATCH 3/4: nsd: Kconfig and build integration
+  PATCH 4/4: Documentation: NSD docs
+
+Questions for reviewers:
+- Is filemap_read() the right hook point?
+- Should prefetch use vfs_fadvise or direct ra_state manipulation?
+- How to handle CONFIG_NSD=m vs =y for symbol export?
+
+Signed-off-by: Ayhan Aydin <nsd.project.dev@gmail.com>
