@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * fs/nsd/core.c - Neural Storage Driver core prediction engine
+ * core.c - Neural Storage Driver core prediction engine
  *
  * A learning prefetcher using a synaptic Markov chain model
  * to predict and prefetch pages in the kernel page cache.
@@ -24,7 +24,6 @@
 #include <linux/random.h>
 #include <linux/sched.h>
 #include <linux/fs.h>
-#include <linux/fadvise.h>
 #include <linux/nsd.h>
 #include <linux/sysfs.h>
 #include <linux/kobject.h>
@@ -33,14 +32,10 @@
 #include <linux/pagemap.h>
 #include <linux/version.h>
 
-#ifndef POSIX_FADV_WILLNEED
-#define POSIX_FADV_WILLNEED 3
-#endif
-
 #define NSD_VERSION             "1.0.0"
 #define NSD_REGION_SHIFT        12
-#define NSD_REGION_BYTES        (1UL << NSD_REGION_SHIFT)
-#define NSD_SYN_TABLE_SIZE      (1 << 20)
+#define NSD_REGION_BYTES        BIT(NSD_REGION_SHIFT)
+#define NSD_SYN_TABLE_SIZE      BIT(20)
 #define NSD_SYN_MASK            (NSD_SYN_TABLE_SIZE - 1)
 #define NSD_STRIDE_PRED_MAX     256
 #define NSD_PREFETCH_DEPTH      256
@@ -49,36 +44,36 @@
 #define NSD_WORKQUEUE_NAME      "nsd_prefetch"
 
 struct nsd_synapse {
-        u64                     key;
-        u32                     next_region;
-        u32                     strength;
-        u32                     hits;
-        u32                     maybe_hits;
-        u32                     chain_count;
-        struct nsd_synapse      *next;
+	u64                     key;
+	u32                     next_region;
+	u32                     strength;
+	u32                     hits;
+	u32                     maybe_hits;
+	u32                     chain_count;
+	struct nsd_synapse      *next;
 };
 
 struct nsd_ring_entry {
-        u32             file_id;
-        u32             region;
-        u64             ts;
+	u32             file_id;
+	u32             region;
+	u64             ts;
 };
 
 struct nsd_pcpu_ring {
-        struct nsd_ring_entry   entries[NSD_RING_SIZE];
-        unsigned int            head;
-        unsigned int            tail;
+	struct nsd_ring_entry   entries[NSD_RING_SIZE];
+	unsigned int            head;
+	unsigned int            tail;
 };
 
 static DEFINE_PER_CPU(struct nsd_pcpu_ring, nsd_rings);
 
 struct nsd_hot_entry {
-        u32             file_id;
-        u32             last_region;
-        u32             stride;
-        s32             stride_count;
-        u32             regions[8];
-        unsigned int    pos;
+	u32             file_id;
+	u32             last_region;
+	u32             stride;
+	s32             stride_count;
+	u32             regions[8];
+	unsigned int    pos;
 };
 
 static struct nsd_hot_entry nsd_hot[NSD_HOT_ENTRIES];
@@ -111,344 +106,342 @@ MODULE_PARM_DESC(waste_track, "Enable waste tracking");
 
 static u32 nsd_file_id(struct file *file)
 {
-        return (u32)((unsigned long)file >> 6);
+	return (u32)((unsigned long)file >> 6);
 }
 
 static u32 nsd_off_to_region(loff_t off)
 {
-        return (u32)(off >> NSD_REGION_SHIFT);
+	return (u32)(off >> NSD_REGION_SHIFT);
 }
 
 static u64 nsd_syn_key(u32 file_id, u32 region)
 {
-        return ((u64)file_id << 32) | region;
+	return ((u64)file_id << 32) | region;
 }
 
 static u32 nsd_syn_hash(u64 key)
 {
-        return (u32)(key ^ (key >> 20)) & NSD_SYN_MASK;
+	return (u32)(key ^ (key >> 20)) & NSD_SYN_MASK;
 }
 
 static struct nsd_synapse *nsd_syn_lookup(u64 key)
 {
-        u32 hash = nsd_syn_hash(key);
-        struct nsd_synapse *s = nsd_syn_table[hash];
+	u32 hash = nsd_syn_hash(key);
+	struct nsd_synapse *s = nsd_syn_table[hash];
 
-        while (s) {
-                if (s->key == key)
-                        return s;
-                s = s->next;
-        }
-        return NULL;
+	while (s) {
+		if (s->key == key)
+			return s;
+		s = s->next;
+	}
+	return NULL;
 }
 
 static struct nsd_synapse *nsd_syn_insert(u64 key, u32 region)
 {
-        u32 hash = nsd_syn_hash(key);
-        struct nsd_synapse *s;
+	u32 hash = nsd_syn_hash(key);
+	struct nsd_synapse *s;
 
-        s = kmalloc(sizeof(*s), GFP_ATOMIC);
-        if (!s)
-                return NULL;
+	s = kmalloc(sizeof(*s), GFP_ATOMIC);
+	if (!s)
+		return NULL;
 
-        s->key = key;
-        s->next_region = 0;
-        s->strength = 1;
-        s->hits = 0;
-        s->maybe_hits = 0;
-        s->chain_count = 0;
-        s->next = nsd_syn_table[hash];
-        nsd_syn_table[hash] = s;
-        atomic64_inc(&nsd_syn_entries);
-        return s;
+	s->key = key;
+	s->next_region = 0;
+	s->strength = 1;
+	s->hits = 0;
+	s->maybe_hits = 0;
+	s->chain_count = 0;
+	s->next = nsd_syn_table[hash];
+	nsd_syn_table[hash] = s;
+	atomic64_inc(&nsd_syn_entries);
+	return s;
 }
 
 static void nsd_syn_learn(u32 file_id, u32 prev_region, u32 cur_region)
 {
-        u64 key;
-        struct nsd_synapse *s;
-        unsigned long flags;
+	u64 key;
+	struct nsd_synapse *s;
+	unsigned long flags;
 
-        if (!prev_region)
-                return;
+	if (!prev_region)
+		return;
 
-        key = nsd_syn_key(file_id, prev_region);
-        spin_lock_irqsave(&nsd_syn_lock, flags);
-        s = nsd_syn_lookup(key);
-        if (!s) {
-                s = nsd_syn_insert(key, cur_region);
-                if (!s) {
-                        spin_unlock_irqrestore(&nsd_syn_lock, flags);
-                        return;
-                }
-        }
-        if (s->next_region == cur_region) {
-                if (s->strength < 1000)
-                        s->strength++;
-        } else if (s->strength > 1) {
-                s->strength--;
-        } else {
-                s->next_region = cur_region;
-        }
-        s->hits++;
-        spin_unlock_irqrestore(&nsd_syn_lock, flags);
+	key = nsd_syn_key(file_id, prev_region);
+	spin_lock_irqsave(&nsd_syn_lock, flags);
+	s = nsd_syn_lookup(key);
+	if (!s) {
+		s = nsd_syn_insert(key, cur_region);
+		if (!s) {
+			spin_unlock_irqrestore(&nsd_syn_lock, flags);
+			return;
+		}
+	}
+	if (s->next_region == cur_region) {
+		if (s->strength < 1000)
+			s->strength++;
+	} else if (s->strength > 1) {
+		s->strength--;
+	} else {
+		s->next_region = cur_region;
+	}
+	s->hits++;
+	spin_unlock_irqrestore(&nsd_syn_lock, flags);
 }
 
 static int nsd_check_stride(struct nsd_hot_entry *h, u32 region)
 {
-        s32 diff;
+	s32 diff;
 
-        if (!h->last_region)
-                goto update;
+	if (!h->last_region)
+		goto update;
 
-        diff = (s32)(region - h->last_region);
-        if (diff > 0 && diff <= 256) {
-                if (h->stride == (u32)diff) {
-                        if (h->stride_count < 1000)
-                                h->stride_count++;
-                } else {
-                        if (h->stride_count > 0)
-                                h->stride_count--;
-                        else
-                                h->stride = (u32)diff;
-                }
-        } else {
-                h->stride_count = 0;
-        }
+	diff = (s32)(region - h->last_region);
+	if (diff > 0 && diff <= 256) {
+		if (h->stride == (u32)diff) {
+			if (h->stride_count < 1000)
+				h->stride_count++;
+		} else {
+			if (h->stride_count > 0)
+				h->stride_count--;
+			else
+				h->stride = (u32)diff;
+		}
+	} else {
+		h->stride_count = 0;
+	}
 
 update:
-        h->last_region = region;
+	h->last_region = region;
 
-        if (h->stride_count >= 2) {
-                atomic_inc(&nsd_stride_preds);
-                return (int)h->stride;
-        }
-        return 0;
+	if (h->stride_count >= 2) {
+		atomic_inc(&nsd_stride_preds);
+		return (int)h->stride;
+	}
+	return 0;
 }
 
 static void nsd_pcpu_push(u32 file_id, u32 region)
 {
-        struct nsd_pcpu_ring *ring = this_cpu_ptr(&nsd_rings);
-        unsigned int next = (ring->head + 1) & (NSD_RING_SIZE - 1);
+	struct nsd_pcpu_ring *ring = this_cpu_ptr(&nsd_rings);
+	unsigned int next = (ring->head + 1) & (NSD_RING_SIZE - 1);
 
-        if (next == ring->tail)
-                return;
+	if (next == ring->tail)
+		return;
 
-        ring->entries[ring->head].file_id = file_id;
-        ring->entries[ring->head].region = region;
-        ring->entries[ring->head].ts = jiffies;
-        ring->head = next;
+	ring->entries[ring->head].file_id = file_id;
+	ring->entries[ring->head].region = region;
+	ring->entries[ring->head].ts = jiffies;
+	ring->head = next;
 }
 
-static void nsd_prefetch(struct file *file, loff_t offset, unsigned int count)
+static void nsd_prefetch(struct file *file, pgoff_t index, unsigned int count)
 {
-        loff_t pos = (loff_t)offset << NSD_REGION_SHIFT;
+	struct address_space *mapping = file->f_mapping;
 
-        while (count--) {
-                vfs_fadvise(file, pos, NSD_REGION_BYTES, POSIX_FADV_WILLNEED);
-                pos += NSD_REGION_BYTES;
-                atomic_inc(&nsd_prefetch_count);
-        }
+	if (!mapping)
+		return;
+
+	page_cache_sync_readahead(mapping, &file->f_ra, file, index, count);
+	atomic_add(count, &nsd_prefetch_count);
 }
 
 static void nsd_process_events(void)
 {
-        struct nsd_pcpu_ring *ring;
-        int cpu;
+	struct nsd_pcpu_ring *ring;
+	int cpu;
 
-        for_each_possible_cpu(cpu) {
-                ring = per_cpu_ptr(&nsd_rings, cpu);
-                while (ring->tail != ring->head) {
-                        struct nsd_ring_entry *e;
-                        u64 key;
+	for_each_possible_cpu(cpu) {
+		ring = per_cpu_ptr(&nsd_rings, cpu);
+		while (ring->tail != ring->head) {
+			struct nsd_ring_entry *e;
+			u64 key;
 
-                        e = &ring->entries[ring->tail];
-                        key = nsd_syn_key(e->file_id, e->region);
+			e = &ring->entries[ring->tail];
+			key = nsd_syn_key(e->file_id, e->region);
 
-                        spin_lock(&nsd_syn_lock);
-                        struct nsd_synapse *s;
+			spin_lock(&nsd_syn_lock);
+			struct nsd_synapse *s;
 				s = nsd_syn_lookup(key);
-                        if (s) {
-                                s->maybe_hits++;
-                                s->chain_count++;
-                        }
-                        spin_unlock(&nsd_syn_lock);
+			if (s) {
+				s->maybe_hits++;
+				s->chain_count++;
+			}
+			spin_unlock(&nsd_syn_lock);
 
-                        ring->tail = (ring->tail + 1) & (NSD_RING_SIZE - 1);
-                }
-        }
+			ring->tail = (ring->tail + 1) & (NSD_RING_SIZE - 1);
+		}
+	}
 }
 
 static int nsd_worker_fn(void *data)
 {
-        while (!kthread_should_stop()) {
-                wait_event_timeout(nsd_worker_wait,
-                                   kthread_should_stop() || nsd_observe_only,
-                                   HZ / 10);
+	while (!kthread_should_stop()) {
+		wait_event_timeout(nsd_worker_wait,
+				   kthread_should_stop() || nsd_observe_only,
+				   HZ / 10);
 
-                if (kthread_should_stop())
-                        break;
-                if (nsd_observe_only)
-                        continue;
+		if (kthread_should_stop())
+			break;
+		if (nsd_observe_only)
+			continue;
 
-                nsd_process_events();
-        }
-        return 0;
+		nsd_process_events();
+	}
+	return 0;
 }
 
 void nsd_notify_read(struct file *file, loff_t pos, size_t len)
 {
-        u32 file_id, cur_region, prev_region;
-        loff_t end;
-        unsigned long flags;
-        struct nsd_hot_entry *h = NULL;
-        int i, stride;
-        loff_t prefetch_pos;
+	u32 file_id, cur_region, prev_region;
+	unsigned long flags;
+	struct nsd_hot_entry *h = NULL;
+	int i, stride;
+		pgoff_t prefetch_idx;
 
-        if (!file || nsd_observe_only)
-                return;
+	if (!file || nsd_observe_only)
+		return;
 
-        file_id = nsd_file_id(file);
-        cur_region = nsd_off_to_region(pos);
-        end = pos + len;
+	file_id = nsd_file_id(file);
+	cur_region = nsd_off_to_region(pos);
+	nsd_pcpu_push(file_id, cur_region);
 
-        nsd_pcpu_push(file_id, cur_region);
+	spin_lock_irqsave(&nsd_hot_lock, flags);
+	for (i = 0; i < NSD_HOT_ENTRIES; i++) {
+		if (nsd_hot[i].file_id == file_id) {
+			h = &nsd_hot[i];
+			break;
+		}
+	}
+	if (!h) {
+		for (i = 0; i < NSD_HOT_ENTRIES; i++) {
+			if (!nsd_hot[i].last_region) {
+				h = &nsd_hot[i];
+				h->file_id = file_id;
+				break;
+			}
+		}
+	}
+	if (!h)
+		h = &nsd_hot[0];
 
-        spin_lock_irqsave(&nsd_hot_lock, flags);
-        for (i = 0; i < NSD_HOT_ENTRIES; i++) {
-                if (nsd_hot[i].file_id == file_id) {
-                        h = &nsd_hot[i];
-                        break;
-                }
-        }
-        if (!h) {
-                for (i = 0; i < NSD_HOT_ENTRIES; i++) {
-                        if (!nsd_hot[i].last_region) {
-                                h = &nsd_hot[i];
-                                h->file_id = file_id;
-                                break;
-                        }
-                }
-        }
-        if (!h)
-                h = &nsd_hot[0];
+	prev_region = h->last_region;
+	h->last_region = cur_region;
+	spin_unlock_irqrestore(&nsd_hot_lock, flags);
 
-        prev_region = h->last_region;
-        h->last_region = cur_region;
-        spin_unlock_irqrestore(&nsd_hot_lock, flags);
+	nsd_syn_learn(file_id, prev_region, cur_region);
 
-        nsd_syn_learn(file_id, prev_region, cur_region);
-
-        stride = nsd_check_stride(h, cur_region);
-        if (stride > 0) {
-                prefetch_pos = pos + ((loff_t)stride << NSD_REGION_SHIFT);
-                nsd_prefetch(file, nsd_off_to_region(prefetch_pos),
-                             min(stride, NSD_PREFETCH_DEPTH));
-                wake_up(&nsd_worker_wait);
-        }
+	stride = nsd_check_stride(h, cur_region);
+	prefetch_idx = (pos >> PAGE_SHIFT) + stride;
+	if (stride > 0) {
+		nsd_prefetch(file, prefetch_idx,
+			     min_t(unsigned int, stride, NSD_PREFETCH_DEPTH));
+		wake_up(&nsd_worker_wait);
+	}
 }
 EXPORT_SYMBOL_GPL(nsd_notify_read);
 
 /* sysfs */
 static ssize_t nsd_stats_show(struct kobject *kobj,
-                              struct kobj_attribute *attr, char *buf)
+			      struct kobj_attribute *attr, char *buf)
 {
-        unsigned long prefetched = atomic_read(&nsd_prefetch_count);
-        unsigned long used = atomic_read(&nsd_used_count);
-        unsigned long wasted = atomic_read(&nsd_waste_count);
-        unsigned long hit_rate = prefetched ? (used * 100 / prefetched) : 0;
+	unsigned long prefetched = atomic_read(&nsd_prefetch_count);
+	unsigned long used = atomic_read(&nsd_used_count);
+	unsigned long wasted = atomic_read(&nsd_waste_count);
+	unsigned long hit_rate = prefetched ? (used * 100 / prefetched) : 0;
 
-        return sysfs_emit(buf,
-                "prefetched   %lu\n"
-                "used         %lu\n"
-                "wasted       %lu\n"
-                "hit_rate_real %lu%%\n"
-                "stride_preds %u\n"
-                "chain_depth  %u\n"
-                "synapse_ents %llu\n"
-                "mode         %s\n",
-                prefetched, used, wasted, hit_rate,
-                atomic_read(&nsd_stride_preds),
-                nsd_chain_depth,
-                atomic64_read(&nsd_syn_entries),
-                nsd_observe_only ? "observe" : "active");
+	return sysfs_emit(buf,
+		"prefetched   %lu\n"
+		"used         %lu\n"
+		"wasted       %lu\n"
+		"hit_rate_real %lu%%\n"
+		"stride_preds %u\n"
+		"chain_depth  %u\n"
+		"synapse_ents %llu\n"
+		"mode         %s\n",
+		prefetched, used, wasted, hit_rate,
+		atomic_read(&nsd_stride_preds),
+		nsd_chain_depth,
+		atomic64_read(&nsd_syn_entries),
+		nsd_observe_only ? "observe" : "active");
 }
+
 static struct kobj_attribute nsd_stats_attr = __ATTR(stats, 0444, nsd_stats_show, NULL);
 
 #define NSD_BOOL_ATTR(name)                                             \
 static ssize_t name##_show(struct kobject *kobj,                        \
-                           struct kobj_attribute *attr, char *buf)      \
+			   struct kobj_attribute *attr, char *buf)      \
 {                                                                       \
-        return sysfs_emit(buf, "%d\n", nsd_##name);                    \
+	return sysfs_emit(buf, "%d\n", nsd_##name);                    \
 }                                                                       \
 static ssize_t name##_store(struct kobject *kobj,                        \
-                            struct kobj_attribute *attr,                \
-                            const char *buf, size_t count)              \
+			    struct kobj_attribute *attr,                \
+			    const char *buf, size_t count)              \
 {                                                                       \
-        bool val;                                                       \
-        if (kstrtobool(buf, &val))                                      \
-                return -EINVAL;                                         \
-        nsd_##name = val;                                               \
-        return count;                                                   \
+	bool val;                                                       \
+	if (kstrtobool(buf, &val))                                      \
+		return -EINVAL;                                         \
+	nsd_##name = val;                                               \
+	return count;                                                   \
 }                                                                       \
 static struct kobj_attribute name##_attr =                              \
-        __ATTR(name, 0644, name##_show, name##_store)
+	__ATTR(name, 0644, name##_show, name##_store)
 
 NSD_BOOL_ATTR(observe_only);
 NSD_BOOL_ATTR(penalty_state);
 NSD_BOOL_ATTR(waste_track);
 
 static struct attribute *nsd_attrs[] = {
-        &nsd_stats_attr.attr,
-        &observe_only_attr.attr,
-        &penalty_state_attr.attr,
-        &waste_track_attr.attr,
-        NULL,
+	&nsd_stats_attr.attr,
+	&observe_only_attr.attr,
+	&penalty_state_attr.attr,
+	&waste_track_attr.attr,
+	NULL,
 };
 ATTRIBUTE_GROUPS(nsd);
 
 static int __init nsd_init(void)
 {
-        int ret;
+	int ret;
 
-        pr_info("NSD v%s loading\n", NSD_VERSION);
+	pr_info("NSD v%s loading\n", NSD_VERSION);
 
-        nsd_wq = alloc_workqueue(NSD_WORKQUEUE_NAME, WQ_UNBOUND, 1);
-        if (!nsd_wq)
-                return -ENOMEM;
+	nsd_wq = alloc_workqueue(NSD_WORKQUEUE_NAME, WQ_UNBOUND, 1);
+	if (!nsd_wq)
+		return -ENOMEM;
 
-        nsd_worker_thread = kthread_run(nsd_worker_fn, NULL, "nsd_worker");
-        if (IS_ERR(nsd_worker_thread)) {
-                destroy_workqueue(nsd_wq);
-                return PTR_ERR(nsd_worker_thread);
-        }
+	nsd_worker_thread = kthread_run(nsd_worker_fn, NULL, "nsd_worker");
+	if (IS_ERR(nsd_worker_thread)) {
+		destroy_workqueue(nsd_wq);
+		return PTR_ERR(nsd_worker_thread);
+	}
 
-        nsd_kobj = kobject_create_and_add("nsd", kernel_kobj);
-        if (!nsd_kobj) {
-                kthread_stop(nsd_worker_thread);
-                destroy_workqueue(nsd_wq);
-                return -ENOMEM;
-        }
+	nsd_kobj = kobject_create_and_add("nsd", kernel_kobj);
+	if (!nsd_kobj) {
+		kthread_stop(nsd_worker_thread);
+		destroy_workqueue(nsd_wq);
+		return -ENOMEM;
+	}
 
-        ret = sysfs_create_groups(nsd_kobj, nsd_groups);
-        if (ret) {
-                kobject_put(nsd_kobj);
-                kthread_stop(nsd_worker_thread);
-                destroy_workqueue(nsd_wq);
-                return ret;
-        }
+	ret = sysfs_create_groups(nsd_kobj, nsd_groups);
+	if (ret) {
+		kobject_put(nsd_kobj);
+		kthread_stop(nsd_worker_thread);
+		destroy_workqueue(nsd_wq);
+		return ret;
+	}
 
-        pr_info("NSD ready | /sys/kernel/nsd/ | observe_only=%d\n", nsd_observe_only);
-        return 0;
+	pr_info("NSD ready | /sys/kernel/nsd/ | observe_only=%d\n", nsd_observe_only);
+	return 0;
 }
 
 static void __exit nsd_exit(void)
 {
-        sysfs_remove_groups(nsd_kobj, nsd_groups);
-        kobject_put(nsd_kobj);
-        kthread_stop(nsd_worker_thread);
-        destroy_workqueue(nsd_wq);
-        pr_info("NSD unloaded\n");
+	sysfs_remove_groups(nsd_kobj, nsd_groups);
+	kobject_put(nsd_kobj);
+	kthread_stop(nsd_worker_thread);
+	destroy_workqueue(nsd_wq);
+	pr_info("NSD unloaded\n");
 }
 
 module_init(nsd_init);
