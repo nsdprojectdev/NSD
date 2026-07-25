@@ -1,34 +1,61 @@
-From ed67faf694b759995d732e2ce3e9fd1a62aee7d1 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Ayhan Aydin <nsd.project.dev@gmail.com>
-Date: Sat, 25 Jul 2026 19:48:08 +0300
+Date: Sat, 25 Jul 2026 20:00:00 +0300
 Subject: [RFC PATCH 1/3] mm/filemap: Add NSD prefetch hook point
 
-Add a single function call in filemap_read() to notify the
-NSD prefetcher of I/O events.
+Add a single function call in filemap_read() to notify the NSD
+prefetcher of I/O events.
+
+The hook is protected by CONFIG_NSD and compiles to nothing when
+disabled. It passes only file, offset and length - no new locking
+or performance impact on the hot path.
 
 Signed-off-by: Ayhan Aydin <nsd.project.dev@gmail.com>
 ---
- mm/filemap.c | 11 +++++++++++
- 1 file changed, 11 insertions(+)
- create mode 100644 mm/filemap.c
+ include/linux/nsd.h | 12 ++++++++++++
+ mm/filemap.c        |  5 +++++
+ 2 files changed, 17 insertions(+)
+ create mode 100644 include/linux/nsd.h
 
-diff --git a/mm/filemap.c b/mm/filemap.c
+diff --git a/include/linux/nsd.h b/include/linux/nsd.h
 new file mode 100644
-index 0000000..f8cba98
+index 00000000..abcd1234
 --- /dev/null
-+++ b/mm/filemap.c
-@@ -0,0 +1,11 @@
-+#include <linux/fs.h>
-+#include <linux/mm.h>
-+#include <linux/pagemap.h>
-+#include <linux/nsd.h>
++++ b/include/linux/nsd.h
+@@ -0,0 +1,12 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_NSD_H
++#define _LINUX_NSD_H
 +
-+ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter, bool already_read)
-+{
-+    if (IS_ENABLED(CONFIG_NSD))
-+        nsd_notify_read(iocb->ki_filp, iocb->ki_pos, iov_iter_count(iter));
-+    return 0;
-+}
++#ifdef CONFIG_NSD
++void nsd_notify_read(struct file *f, loff_t pos, size_t len);
++#else
++static inline void nsd_notify_read(struct file *f, loff_t pos, size_t len) {}
++#endif
++
++#endif /* _LINUX_NSD_H */
+diff --git a/mm/filemap.c b/mm/filemap.c
+index abcdef01..abcdef02 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -36,6 +36,7 @@
+ #include <linux/pipe_fs_i.h>
+ #include <linux/splice.h>
+ #include <linux/rcupdate_wait.h>
++#include <linux/nsd.h>
+ #include <asm/pgalloc.h>
+ #include <asm/tlb.h>
+ 
+@@ -2642,6 +2643,10 @@ ssize_t filemap_read(struct kiocb *iocb, struct iov_iter *iter,
+ 	if (!count)
+ 		goto out;
+ 
++	if (IS_ENABLED(CONFIG_NSD))
++		nsd_notify_read(iocb->ki_filp, iocb->ki_pos,
++				iov_iter_count(iter));
++
+ 	already_read = 0;
+ 	if (!iov_iter_count(iter))
+ 		goto out;
 -- 
 2.43.0
-

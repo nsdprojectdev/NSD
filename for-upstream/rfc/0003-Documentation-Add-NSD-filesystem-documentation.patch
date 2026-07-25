@@ -28,7 +28,7 @@ index 0000000..a78018a
 +========
 +NSD is a learning prefetcher for the Linux kernel page cache. It monitors
 +I/O patterns via a hook in :c:func:`filemap_read` and prefetches pages
-+ahead of the application using :c:func:`vfs_fadvise`.
++ahead of the application using :c:func:`page_cache_sync_readahead`.
 +
 +Unlike the kernel existing readahead (fixed window), NSD builds
 +a synaptic Markov chain model of access patterns at 4 KB region
@@ -51,7 +51,7 @@ index 0000000..a78018a
 +                   |
 +                   +---> Prefetch Worker
 +                            |
-+                            +---> vfs_fadvise(WILLNEED)
++                            +---> page_cache_sync_readahead(WILLNEED)
 +
 +Sysfs Interface
 +===============

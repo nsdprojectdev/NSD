@@ -29,7 +29,7 @@ index 0000000..5ddd8cc
 +	help
 +	  NSD is a learning prefetcher that monitors I/O patterns via a hook
 +	  in the kernel page cache read path and prefetches pages using
-+	  vfs_fadvise(WILLNEED).
++	  page_cache_sync_readahead().
 +
 +	  It builds a synaptic Markov chain model of access patterns at
 +	  4KB region granularity, detecting sequential strides, repeating
@@ -359,7 +359,7 @@ index 0000000..1f42fa9
 +	unsigned long flags;
 +	struct nsd_hot_entry *h = NULL;
 +	int i, stride;
-+		pgoff_t prefetch_idx;
++	pgoff_t prefetch_idx;
 +
 +	if (!file || nsd_observe_only)
 +		return;
