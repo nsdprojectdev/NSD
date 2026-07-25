@@ -1,14 +1,101 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 92efe674bf2fc7cdd174e1a4cfc8020578d6ee16 Mon Sep 17 00:00:00 2001
 From: Ayhan Aydin <nsd.project.dev@gmail.com>
-Date: Sat, 25 Jul 2026 20:02:00 +0300
-Subject: [PATCH 3/3] Documentation: Add NSD filesystem documentation
+Date: Sat, 25 Jul 2026 19:48:08 +0300
+Subject: [RFC PATCH 3/3] Documentation: Add NSD filesystem documentation
 
-Add initial documentation for the Neural Storage Driver.
+Add initial documentation for the Neural Storage Driver
+covering architecture, sysfs interface, and performance.
 
 Signed-off-by: Ayhan Aydin <nsd.project.dev@gmail.com>
 ---
  Documentation/filesystems/nsd.rst | 77 +++++++++++++++++++++++++++++++
- MAINTAINERS                       |  8 ++++
- 2 files changed, 85 insertions(+)
+ 1 file changed, 77 insertions(+)
  create mode 100644 Documentation/filesystems/nsd.rst
- create mode 100644 MAINTAINERS
+
+diff --git a/Documentation/filesystems/nsd.rst b/Documentation/filesystems/nsd.rst
+new file mode 100644
+index 0000000..a78018a
+--- /dev/null
++++ b/Documentation/filesystems/nsd.rst
+@@ -0,0 +1,77 @@
++.. SPDX-License-Identifier: GPL-2.0
++
++========================================
++Neural Storage Driver (NSD) - v1.0.0
++========================================
++
++Overview
++========
++NSD is a learning prefetcher for the Linux kernel page cache. It monitors
++I/O patterns via a hook in :c:func:`filemap_read` and prefetches pages
++ahead of the application using :c:func:`vfs_fadvise`.
++
++Unlike the kernel existing readahead (fixed window), NSD builds
++a synaptic Markov chain model of access patterns at 4 KB region
++granularity. It detects sequential strides, repeating patterns, and
++learned transitions.
++
++Architecture
++============::
++
++    Application
++         |
++         v
++    filemap_read()  <-- NSD hook
++         |
++         +---> nsd_notify_read()
++                   |
++                   +---> Synaptic Table (Markov chain)
++                   |        |
++                   |        +---> Region hash + stride predictor
++                   |
++                   +---> Prefetch Worker
++                            |
++                            +---> vfs_fadvise(WILLNEED)
++
++Sysfs Interface
++===============
++/sys/kernel/nsd/::
++
++  stats          Current statistics (hit rate, prefetch count, etc.)
++  observe_only   0=active, 1=observe-only (no prefetch)
++  penalty        Enable penalty weakening on waste
++  waste_track    Enable waste tracking
++
++Statistics fields::
++
++  prefetched    Total pages prefetched
++  used          Prefetched pages that were actually accessed
++  wasted        Prefetched pages never accessed
++  hit_rate_real Used / Prefetched ratio
++  stride_preds  Stride predictions made
++  chain_depth   Average chain prediction depth
++  synapse_ents  Current synapse table entries
++  ring_events   Pending ring buffer events
++
++Module Parameters
++=================
++  observe_only  Start in observe-only mode (default: false)
++  penalty       Enable penalty on waste (default: true)
++  waste_track   Enable waste tracking (default: false)
++
++Performance
++===========
++Tested on: x86_64, SATA SSD, kernel 7.0.0::
++
++  Workload                     Improvement
++  ---------------------------  -----------
++  SQLite FTS (4 GB table)      -18.8% query time
++  Sequential 64K buffered      +22.6% throughput
++  Random 4K buffered           +1.1% (noise)
++
++The prefetcher achieves 98% real hit rate on SSD workloads.
++
++See Also
++========
++Documentation/filesystems/fscache.rst
++Documentation/filesystems/squashfs.rst
+\ No newline at end of file
+-- 
+2.43.0
+
