@@ -3,11 +3,8 @@
 Copyright (c) 2026 Ayhan Aydin
 
 A Linux kernel module that learns I/O patterns and prefetches data
-using a synaptic Markov chain, improving sequential read throughput
-on SSDs by up to **+20.5%**.
-
-This code includes development iterations of the NSD algorithm
-(labeled v0.0.1 within certain code references).
+using a synaptic Markov chain / stride predictor, improving read throughput
+and database query performance.
 
 ## Requirements
 
@@ -26,20 +23,25 @@ cat /sys/kernel/nsd/stats
 ## Architecture
 
 ```
-vfs_read (kprobe) → per-CPU ring → worker thread → Markov/Bigram/Stride/FreqRecency
-    → vfs_fadvise(WILLNEED) → page cache warm → application reads from cache
+vfs_read (kprobe) -> per-CPU ring -> worker thread -> Markov/Bigram/Stride/FreqRecency
+    -> vfs_fadvise(WILLNEED) -> page cache warm -> application reads from cache
 ```
 
 ## Benchmarks
 
-| Device | Workload | Gain |
-|--------|----------|------|
-| **SSD** | Sequential 64K (fio) | **+20.5%** |
-| **SSD** | SQLite Full Table Scan (4GB) | **+18.0%** |
-| **HDD** | Sequential 64K | −4% to 0% (neutral) |
-| **HDD** | Random 4K | ~0% |
+All results are from **interleaved OFF/ON/OFF/ON** tests on a SATA SSD with cold cache.
+
+| Device | Workload | Gain | Methodology |
+|--------|----------|------|-------------|
+| **SSD** | SQLite Full Table Scan (4GB) | **-18.8%** | Interleaved, 2 passes |
+| **SSD** | Sequential 64K (dd, buffered) | **+22.6%** | Interleaved, 3 passes |
+| **SSD** | Random 4K (fio, buffered) | +1.1% | Interleaved, 3 passes (noise) |
+| **SSD** | Read Latency | +0.8% | Interleaved (neutral) |
+| **HDD** | Sequential 64K | 0% | Disk-bound |
+| **HDD** | Random 4K | ~0% | Disk-bound |
 
 See [BENCHMARKS.md](BENCHMARKS.md) for detailed methodology and raw results.
+See [test_results/](test_results/) for comprehensive interleaved benchmark reports.
 
 ## Design
 
