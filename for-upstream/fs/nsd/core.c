@@ -44,7 +44,7 @@
 #define NSD_SYN_MASK            (NSD_SYN_TABLE_SIZE - 1)
 #define NSD_STRIDE_PRED_MAX     256
 #define NSD_PREFETCH_DEPTH      256
-#define NSD_RING_SIZE           4096
+#define NSD_RING_SIZE           256
 #define NSD_HOT_ENTRIES         1024
 #define NSD_WORKQUEUE_NAME      "nsd_prefetch"
 
@@ -102,11 +102,11 @@ static DECLARE_WAIT_QUEUE_HEAD(nsd_worker_wait);
 static struct workqueue_struct *nsd_wq;
 static struct kobject *nsd_kobj;
 
-module_param(observe_only, bool, 0644);
+module_param_named(observe_only, nsd_observe_only, bool, 0644);
 MODULE_PARM_DESC(observe_only, "Start in observe-only mode");
-module_param(penalty_state, bool, 0644);
+module_param_named(penalty_state, nsd_penalty_state, bool, 0644);
 MODULE_PARM_DESC(penalty_state, "Enable penalty on waste");
-module_param(waste_track, bool, 0644);
+module_param_named(waste_track, nsd_waste_track, bool, 0644);
 MODULE_PARM_DESC(waste_track, "Enable waste tracking");
 
 static u32 nsd_file_id(struct file *file)
@@ -359,36 +359,27 @@ static ssize_t nsd_stats_show(struct kobject *kobj,
         unsigned long hit_rate = prefetched ? (used * 100 / prefetched) : 0;
 
         return sysfs_emit(buf,
-                "prefetched   %lu
-"
-                "used         %lu
-"
-                "wasted       %lu
-"
-                "hit_rate_real %lu%%
-"
-                "stride_preds %u
-"
-                "chain_depth  %u
-"
-                "synapse_ents %llu
-"
-                "mode         %s
-",
+                "prefetched   %lu\n"
+                "used         %lu\n"
+                "wasted       %lu\n"
+                "hit_rate_real %lu%%\n"
+                "stride_preds %u\n"
+                "chain_depth  %u\n"
+                "synapse_ents %llu\n"
+                "mode         %s\n",
                 prefetched, used, wasted, hit_rate,
                 atomic_read(&nsd_stride_preds),
                 nsd_chain_depth,
                 atomic64_read(&nsd_syn_entries),
                 nsd_observe_only ? "observe" : "active");
 }
-static struct kobj_attribute nsd_stats_attr = __ATTR_RO(stats);
+static struct kobj_attribute nsd_stats_attr = __ATTR(stats, 0444, nsd_stats_show, NULL);
 
 #define NSD_BOOL_ATTR(name)                                             \
 static ssize_t name##_show(struct kobject *kobj,                        \
                            struct kobj_attribute *attr, char *buf)      \
 {                                                                       \
-        return sysfs_emit(buf, "%d
-", nsd_##name);                     \
+        return sysfs_emit(buf, "%d\n", nsd_##name);                    \
 }                                                                       \
 static ssize_t name##_store(struct kobject *kobj,                        \
                             struct kobj_attribute *attr,                \
@@ -420,8 +411,7 @@ static int __init nsd_init(void)
 {
         int ret;
 
-        pr_info("NSD v%s loading
-", NSD_VERSION);
+        pr_info("NSD v%s loading\n", NSD_VERSION);
 
         nsd_wq = alloc_workqueue(NSD_WORKQUEUE_NAME, WQ_UNBOUND, 1);
         if (!nsd_wq)
@@ -448,9 +438,7 @@ static int __init nsd_init(void)
                 return ret;
         }
 
-        pr_info("NSD ready | /sys/kernel/nsd/ | observe_only=%d
-",
-                nsd_observe_only);
+        pr_info("NSD ready | /sys/kernel/nsd/ | observe_only=%d\n", nsd_observe_only);
         return 0;
 }
 
@@ -460,8 +448,7 @@ static void __exit nsd_exit(void)
         kobject_put(nsd_kobj);
         kthread_stop(nsd_worker_thread);
         destroy_workqueue(nsd_wq);
-        pr_info("NSD unloaded
-");
+        pr_info("NSD unloaded\n");
 }
 
 module_init(nsd_init);
