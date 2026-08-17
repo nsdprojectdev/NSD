@@ -1,15 +1,15 @@
 # BUGS_FIXED
 
-NSD geliştirme sürecinde tespit edilip düzeltilen hataların kaydı.
+Record of bugs found and fixed during NSD development.
 
 ---
 
-## 2026-08-17 — sysfs debug arayüzünde buffer overflow (sprintf → scnprintf)
+## 2026-08-17 — Buffer overflow in sysfs debug interface (sprintf → scnprintf)
 
-**Dosya:** `nsd.c` (9 çağrı noktası)
+**File:** `nsd.c` (9 call sites)
 
-**Belirti:** Uzun süreli kullanımda (4.5 gün uptime, NSD yüklü) `drop_caches`
-sırasında kernel oops + RCU stall + tam sistem donması:
+**Symptom:** After extended use (4.5 days uptime, NSD loaded), `drop_caches`
+triggered kernel oops + RCU stall + full system hang:
 
 ```
 Oops: general protection fault, probably for non-canonical address 0x6f635f64616576d0
@@ -17,24 +17,26 @@ RIP: lru_gen_clear_refs+0x8f/0x100  (MGLRU)
 RIP: memcg_list_lru_alloc+0xd5/0x220 (socket inode alloc)
 ```
 
-Oops adreslerinin ASCII çözümlemesi (`read_count`, `=20874`, `ot=1049`)
-taşan verinin `fctx_debug` çıktısının parçası olduğunu gösterdi.
+ASCII decoding of the oops registers (`read_count`, `=20874`, `ot=1049`)
+showed the corrupted memory contained parts of the `fctx_debug` output.
 
-**Kök neden:** `fctx_debug_show()` fonksiyonu 256 fctx slotunun her biri için
-~110 karakterlik satır üretiyordu (`sprintf(buf + len, ...)` — sınırsız yazma).
-Kernel sysfs read buffer yalnızca PAGE_SIZE (4096 byte). 256 × 110 ≈ 29 KB
-yazım girişimi buffer taşmasına ve çekirdek bellek bozulmasına yol açtı.
-Diğer 8 sysfs show fonksiyonunda da aynı desen (sınırsız `sprintf`, sabit
-buffer) mevcuttu; daha küçük çıktı ürettikleri için henüz tetiklenmemişti.
+**Root cause:** `fctx_debug_show()` produced a ~110-character line per fctx
+slot (`sprintf(buf + len, ...)` — unbounded write). With 256 slots that is
+~29KB written into a kernel sysfs read buffer of only PAGE_SIZE (4096 bytes),
+overflowing the buffer and corrupting kernel memory. The other 8 sysfs show
+handlers had the same pattern (unbounded `sprintf` into a fixed-size buffer);
+they had not triggered yet only because their output is smaller.
 
-**Tespit ediliş şekli:** Dump'lanan oops register'larındaki ASCII string'lerin
-(`read_co` = `read_count` alan adı) `fctx_debug` formatıyla eşleşmesi +
-`kobj_attr_show returned bad count` uyarısının oops'tan 56 sn önce gelmesi.
+**How it was found:** The ASCII strings in the dumped oops registers
+(`read_co` = the `read_count` field name) matched the `fctx_debug` format,
+and a `kobj_attr_show returned bad count` warning appeared 56s before the
+first oops.
 
-**Düzeltme:** Dosyadaki tüm `sprintf(buf, ...)` çağrıları güvenli
-`scnprintf(buf, PAGE_SIZE, ...)` ile değiştirildi; `fctx_debug_show()` ayrıca
-`len >= PAGE_SIZE` sınırında döngüyü kırar. Sonuç: çıktı tam 4095 byte'ta
-kesiliyor, taşma imkânsız.
+**Fix:** All `sprintf(buf, ...)` calls in the file were replaced with bounded
+`scnprintf(buf, PAGE_SIZE, ...)`; `fctx_debug_show()` additionally breaks out
+of its slot loop at `len >= PAGE_SIZE`. Result: output is capped at exactly
+4095 bytes — overflow is impossible.
 
-**Doğrulama:** Düzeltme sonrası 100× `cat /sys/kernel/nsd/fctx_debug` +
-50× tüm diğer sysfs dosyaları stres okuması: 0 oops, 0 BUG, 0 uyarı.
+**Verification:** After the fix, 100× `cat /sys/kernel/nsd/fctx_debug` plus
+50× stress reads of all other sysfs files: 0 oops, 0 BUG, 0 warnings.
+A 15-round drop_caches → fctx_debug → SQLite pass loop also ran clean.
