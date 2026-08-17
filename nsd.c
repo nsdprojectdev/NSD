@@ -929,7 +929,7 @@ static __maybe_unused void nsd_workload_update(struct nsd_fctx *ctx, u32 region,
 
 
         {
-            if (seq_r > 800 && small_r < 500) {
+            if (0 && seq_r > 800 && small_r < 500) { /* seq_large guard DISABLED for RFC benchmark snapshot */
                 atomic64_inc(&nsd.st_seq_large);
                 proposed = NSD_STRAT_NONE;
             } else if (seq_r < 120 && rpt_r < 100) {
