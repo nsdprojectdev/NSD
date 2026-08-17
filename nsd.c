@@ -2130,7 +2130,7 @@ static __maybe_unused ssize_t stats_show(struct kobject *k, struct kobj_attribut
         if (_cnt) { hist_acc /= _cnt; rec_acc /= _cnt; lr /= _cnt; }
     }
 
-    len = sprintf(buf,
+    len = scnprintf(buf, PAGE_SIZE,
         "version:%s\n"
         "running:%d\nhook:%d\nobserve_only:%d\n"
         "features:stride=%d procaware=%d\n"
@@ -2228,7 +2228,8 @@ static __maybe_unused ssize_t fctx_debug_show(struct kobject *k, struct kobj_att
     for (i = 0; i < NSD_FCTX_SLOTS; i++) {
         struct nsd_fctx *fc = &nsd.fctx.e[i];
         if (!fc->valid) continue;
-        len += sprintf(buf + len,
+        if (len >= PAGE_SIZE) break;
+        len += scnprintf(buf + len, PAGE_SIZE - len,
             "fctx[%d]: file_id=%u read_count=%llu pred=%u cor=%u depth=%u thresh=%u span=%llu dis=%d hist=%u rec=%u lr=%u\n",
             i, fc->file_id,
             (unsigned long long)fc->read_count,
@@ -2245,7 +2246,7 @@ static __maybe_unused ssize_t fctx_debug_show(struct kobject *k, struct kobj_att
 static __maybe_unused ssize_t hook_enable_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     (void)k; (void)a;
-    return sprintf(buf, "%d\n", atomic_read(&nsd.hook_on));
+    return scnprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&nsd.hook_on));
 }
 static __maybe_unused ssize_t hook_enable_store(struct kobject *k, struct kobj_attribute *a,
                                   const char *buf, size_t n)
@@ -2262,7 +2263,7 @@ static __maybe_unused ssize_t hook_enable_store(struct kobject *k, struct kobj_a
 static __maybe_unused ssize_t observe_only_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     (void)k; (void)a;
-    return sprintf(buf, "%d\n", atomic_read(&nsd.observe_only));
+    return scnprintf(buf, PAGE_SIZE, "%d\n", atomic_read(&nsd.observe_only));
 }
 static __maybe_unused ssize_t observe_only_store(struct kobject *k, struct kobj_attribute *a,
                                    const char *buf, size_t n)
@@ -2285,7 +2286,7 @@ static __maybe_unused ssize_t mode_show(struct kobject *k, struct kobj_attribute
     case NSD_MODE_AIR_GAP:   s = "air_gap";   break;
     default:                 s = "normal";    break;
     }
-    return sprintf(buf, "%s\n", s);
+    return scnprintf(buf, PAGE_SIZE, "%s\n", s);
 }
 
 static __maybe_unused ssize_t mode_store(struct kobject *k, struct kobj_attribute *a,
@@ -2335,7 +2336,7 @@ static __maybe_unused ssize_t mode_store(struct kobject *k, struct kobj_attribut
 static __maybe_unused ssize_t depth_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     (void)k; (void)a;
-    return sprintf(buf, "%u\n", READ_ONCE(nsd.depth));
+    return scnprintf(buf, PAGE_SIZE, "%u\n", READ_ONCE(nsd.depth));
 }
 static __maybe_unused ssize_t depth_store(struct kobject *k, struct kobj_attribute *a,
                             const char *buf, size_t n)
@@ -2350,7 +2351,7 @@ static __maybe_unused ssize_t depth_store(struct kobject *k, struct kobj_attribu
 static __maybe_unused ssize_t thresh_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     (void)k; (void)a;
-    return sprintf(buf, "%u\n", READ_ONCE(nsd.thresh));
+    return scnprintf(buf, PAGE_SIZE, "%u\n", READ_ONCE(nsd.thresh));
 }
 static __maybe_unused ssize_t thresh_store(struct kobject *k, struct kobj_attribute *a,
                              const char *buf, size_t n)
@@ -2365,7 +2366,7 @@ static __maybe_unused ssize_t thresh_store(struct kobject *k, struct kobj_attrib
 static __maybe_unused ssize_t dev_class_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     (void)k; (void)a;
-    return sprintf(buf, "%s\n", nsd_dev_names[READ_ONCE(nsd.dev_class)]);
+    return scnprintf(buf, PAGE_SIZE, "%s\n", nsd_dev_names[READ_ONCE(nsd.dev_class)]);
 }
 
 static __maybe_unused ssize_t dev_class_store(struct kobject *k, struct kobj_attribute *a,
@@ -2424,7 +2425,7 @@ static __maybe_unused ssize_t dev_class_store(struct kobject *k, struct kobj_att
 static __maybe_unused ssize_t features_show(struct kobject *k, struct kobj_attribute *a, char *buf)
 {
     (void)k; (void)a;
-    return sprintf(buf, "stride=%d autothresh=%d fine_decay=%d procaware=%d waste_track=%d\n",
+    return scnprintf(buf, PAGE_SIZE, "stride=%d autothresh=%d fine_decay=%d procaware=%d waste_track=%d\n",
                    atomic_read(&nsd.feat_stride),
                    atomic_read(&nsd.feat_autothresh),
                    atomic_read(&nsd.feat_fine_decay),
