@@ -322,9 +322,9 @@ index 0000000..1f42fa9
 +			e = &ring->entries[ring->tail];
 +			key = nsd_syn_key(e->file_id, e->region);
 +
-+			spin_lock(&nsd_syn_lock);
 +			struct nsd_synapse *s;
-+				s = nsd_syn_lookup(key);
++			spin_lock(&nsd_syn_lock);
++			s = nsd_syn_lookup(key);
 +			if (s) {
 +				s->maybe_hits++;
 +				s->chain_count++;

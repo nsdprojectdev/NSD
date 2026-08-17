@@ -28,6 +28,7 @@
 #include <linux/shrinker.h>
 #include <linux/sysinfo.h>
 #include <linux/fs.h>
+#include <linux/mm.h>
 #include <linux/fadvise.h>
 #include <linux/version.h>
 #include <linux/ptrace.h>
@@ -225,10 +226,22 @@ struct nsd_hot_entry {
     u64  last_ns;
 };
 
+#define NSD_HOTMAP_SLOTS 64
+
+struct nsd_hotmap_entry {
+    u32 region;
+    u32 count;
+};
+
+#define NSD_HOTMAP_SLOTS 4096
+
 struct nsd_workload {
     u32  event_count;
     u32  seq_count;
     u32  repeat_count;
+    u32  small_count;
+    u32  syn_hits;
+    u32  syn_trials;
     s64  last_delta;
     enum nsd_strategy active;
     enum nsd_strategy pending;
@@ -258,6 +271,8 @@ struct nsd_fctx {
     struct nsd_workload wl;
     struct nsd_hot_entry hot[NSD_HOT_SLOTS];
     u8                 hot_used;
+    u8                 warm_pending;
+    u8                 warm_done;
 
 
     s32                stride_deltas[3];
@@ -351,6 +366,7 @@ static struct {
     atomic_t feat_autothresh;
     atomic_t feat_fine_decay;
     atomic_t feat_procaware;
+    atomic_t feat_warm;
     atomic_t feat_waste_track;
 
 
@@ -375,6 +391,31 @@ static struct {
     atomic64_t st_autothresh_adj;
     atomic64_t st_stride_predictions;
     atomic64_t st_stride_chain;
+    atomic64_t st_pred_fwd;
+    atomic64_t st_pred_rev;
+    atomic64_t st_pf_fwd;
+    atomic64_t st_pf_rev;
+
+    atomic64_t st_prof_windows;
+    atomic64_t st_prof_seq_r_sum;
+    atomic64_t st_prof_rpt_r_sum;
+    atomic64_t st_prof_small_r_sum;
+    atomic64_t st_prof_syn_r_sum;
+    atomic64_t st_wl_seq;
+    atomic64_t st_wl_random;
+    atomic64_t st_wl_pattern;
+    atomic64_t st_wl_mixed;
+    atomic64_t st_prop_none;
+    atomic64_t st_prop_markov;
+    atomic64_t st_prop_bigram;
+    atomic64_t st_prop_freq;
+    atomic64_t st_seq_large;
+    atomic64_t st_warm;
+    atomic64_t st_warm_skip;
+    atomic64_t st_hotmap_total;
+    atomic64_t st_hotmap_hot;
+    struct nsd_hotmap_entry hotmap[NSD_HOTMAP_SLOTS];
+    u8                 hotmap_used;
 } nsd = {
     .running       = ATOMIC_INIT(0),
     .hook_on       = ATOMIC_INIT(0),
@@ -385,6 +426,7 @@ static struct {
     .feat_fine_decay = ATOMIC_INIT(1),
 .feat_procaware  = ATOMIC_INIT(1),
     .feat_waste_track = ATOMIC_INIT(0),
+    .feat_warm     = ATOMIC_INIT(1),
     .dev_class     = NSD_DEV_SSD,
     .region_shift  = NSD_REGION_SHIFT_SSD,
     .depth         = NSD_DEPTH_SSD,
@@ -666,6 +708,35 @@ done:
                            msecs_to_jiffies(NSD_W_DECAY_MS));
 }
 
+static __maybe_unused void nsd_hotmap_update(u32 region)
+{
+    int i, min_i = -1;
+    u32 min_c = ~0U;
+
+    atomic64_inc(&nsd.st_hotmap_total);
+
+    for (i = 0; i < nsd.hotmap_used; i++) {
+        if (nsd.hotmap[i].region == region) {
+            nsd.hotmap[i].count++;
+            atomic64_inc(&nsd.st_hotmap_hot);
+            return;
+        }
+        if (nsd.hotmap[i].count < min_c) {
+            min_c = nsd.hotmap[i].count;
+            min_i = i;
+        }
+    }
+
+    if (nsd.hotmap_used < NSD_HOTMAP_SLOTS) {
+        nsd.hotmap[nsd.hotmap_used].region = region;
+        nsd.hotmap[nsd.hotmap_used].count  = 1;
+        nsd.hotmap_used++;
+    } else {
+        nsd.hotmap[min_i].region = region;
+        nsd.hotmap[min_i].count  = 1;
+    }
+}
+
 static __maybe_unused void nsd_hot_update(struct nsd_fctx *ctx, u32 region, u64 now)
 {
     int i, oldest_slot = 0;
@@ -789,14 +860,29 @@ static inline int nsd_strat_rank(enum nsd_strategy s)
 }
 
 static __maybe_unused void nsd_workload_update(struct nsd_fctx *ctx, u32 region,
-                                 u32 prev_region, u64 now)
+                                 u32 prev_region, u64 now, size_t io_size,
+                                 bool has_prev)
 {
     struct nsd_workload *w = &ctx->wl;
     s64 delta = (s64)region - (s64)prev_region;
     int i;
 
     w->event_count++;
+    if (io_size < NSD_SMALL_IO_THRESH)
+        w->small_count++;
     nsd_hot_update(ctx, region, now);
+    nsd_hotmap_update(region);
+
+    if (has_prev) {
+        u32  pred_r = 0;
+        u16  pred_w = 0;
+        int  pred_way = -1;
+        bool pf = nsd_syn_predict(nsd_syn_key(ctx->file_id, prev_region),
+                                  &pred_r, &pred_w, &pred_way);
+        w->syn_trials++;
+        if (pf && pred_r == region)
+            w->syn_hits++;
+    }
 
 
     if (ctx->total_bytes_read > 0 && ctx->total_bytes_read < NSD_SMALL_IO_THRESH) {
@@ -821,20 +907,68 @@ static __maybe_unused void nsd_workload_update(struct nsd_fctx *ctx, u32 region,
         ((w->event_count & 31U) == 0 && w->event_count >= 32)) {
         u32 seq_r = (w->seq_count * 1000) / w->event_count;
         u32 rpt_r = (w->repeat_count * 1000) / w->event_count;
+        u32 small_r = (w->small_count * 1000) / w->event_count;
+        u32 syn_r = (w->syn_trials > 0) ?
+                    (w->syn_hits * 1000) / w->syn_trials : 0;
         enum nsd_strategy proposed;
-        bool full = (w->event_count >= NSD_PROFILE_WINDOW);
+
+        atomic64_inc(&nsd.st_prof_windows);
+        atomic64_add(seq_r, &nsd.st_prof_seq_r_sum);
+        atomic64_add(rpt_r, &nsd.st_prof_rpt_r_sum);
+        atomic64_add(small_r, &nsd.st_prof_small_r_sum);
+        atomic64_add(syn_r, &nsd.st_prof_syn_r_sum);
+
+        if (seq_r > 800 && rpt_r < 200)
+            atomic64_inc(&nsd.st_wl_seq);
+        else if (seq_r < 100 && rpt_r < 100)
+            atomic64_inc(&nsd.st_wl_random);
+        else if (rpt_r > 600)
+            atomic64_inc(&nsd.st_wl_pattern);
+        else
+            atomic64_inc(&nsd.st_wl_mixed);
 
 
-        if (seq_r < 120 && rpt_r < 100) {
-            proposed = NSD_STRAT_NONE;
-        } else if (full && rpt_r > NSD_RPT_RATIO_THRESH) {
-            proposed = NSD_STRAT_FREQ_RECENCY;
-        } else if (full && seq_r > 200 && rpt_r > 150) {
-            proposed = NSD_STRAT_BIGRAM;
-        } else if (rpt_r > (full ? 75U : 200U)) {
-            proposed = NSD_STRAT_FREQ_RECENCY;
-        } else {
-            proposed = NSD_STRAT_MARKOV;
+        {
+            if (seq_r > 800 && small_r < 500) {
+                atomic64_inc(&nsd.st_seq_large);
+                proposed = NSD_STRAT_NONE;
+            } else if (seq_r < 120 && rpt_r < 100) {
+                if (syn_r >= 600) {
+                    atomic64_inc(&nsd.st_wl_pattern);
+                    proposed = NSD_STRAT_MARKOV;
+                } else {
+                    proposed = NSD_STRAT_NONE;
+                    if (ctx && !ctx->warm_done &&
+                        !atomic_read(&nsd.observe_only) &&
+                        atomic_read(&nsd.feat_warm)) {
+                        ctx->warm_pending = 1;
+                        ctx->warm_done    = 1;
+                    }
+                }
+            } else if (rpt_r > NSD_RPT_RATIO_THRESH) {
+                proposed = NSD_STRAT_FREQ_RECENCY;
+            } else if (seq_r > 200 && rpt_r > 150) {
+                proposed = NSD_STRAT_BIGRAM;
+            } else if (rpt_r > 200U) {
+                proposed = NSD_STRAT_FREQ_RECENCY;
+            } else {
+                proposed = NSD_STRAT_MARKOV;
+            }
+        }
+
+        switch (proposed) {
+        case NSD_STRAT_NONE:
+            atomic64_inc(&nsd.st_prop_none);
+            break;
+        case NSD_STRAT_MARKOV:
+            atomic64_inc(&nsd.st_prop_markov);
+            break;
+        case NSD_STRAT_BIGRAM:
+            atomic64_inc(&nsd.st_prop_bigram);
+            break;
+        default:
+            atomic64_inc(&nsd.st_prop_freq);
+            break;
         }
 
 
@@ -870,6 +1004,9 @@ static __maybe_unused void nsd_workload_update(struct nsd_fctx *ctx, u32 region,
 
         w->seq_count    = 0;
         w->repeat_count = 0;
+        w->small_count  = 0;
+        w->syn_hits     = 0;
+        w->syn_trials   = 0;
         w->event_count  = 0;
     }
 }
@@ -1230,6 +1367,36 @@ static enum nsd_workload_type nsd_update_workload_state(struct nsd_fctx *ctx, u3
     return NSD_WL_MIXED;
 }
 
+struct nsd_warm_req {
+    struct work_struct work;
+    struct file      *file;
+};
+
+static struct nsd_warm_req nsd_warm_req;
+
+static void nsd_warm_worker(struct work_struct *work)
+{
+    struct nsd_warm_req *req = container_of(work, struct nsd_warm_req, work);
+    struct file *file = req->file;
+    struct inode *in = file->f_inode;
+    loff_t size;
+    loff_t cap;
+
+    if (in) {
+        size = i_size_read(in);
+        cap = (loff_t)totalram_pages() * PAGE_SIZE / 8;
+        if (size > 0 && size <= cap) {
+            atomic64_inc(&nsd.st_warm);
+            pr_info("[NSD] warm: size=%lld cap=%lld\n",
+                    (long long)size, (long long)cap);
+            generic_fadvise(file, 0, size, POSIX_FADV_WILLNEED);
+        } else {
+            atomic64_inc(&nsd.st_warm_skip);
+        }
+    }
+    fput(file);
+}
+
 static __maybe_unused void nsd_do_prefetch(struct file *file, u32 file_id,
                              u32 region, u32 prev_region,
                              bool has_prev, struct nsd_fctx *ctx)
@@ -1339,6 +1506,10 @@ static __maybe_unused void nsd_do_prefetch(struct file *file, u32 file_id,
         if (coalesce_len > 1)                                            \
             atomic64_inc(&nsd.st_coalesced);                             \
         atomic64_inc(&nsd.st_prefetch);                                  \
+        if (coalesce_start > region)                                     \
+            atomic64_inc(&nsd.st_pf_fwd);                                \
+        else if (coalesce_start < region)                                \
+            atomic64_inc(&nsd.st_pf_rev);                                \
         if (ctx) ctx->pf_count++;                                        \
         coalesce_start     = 0;                                          \
         coalesce_len       = 0;                                          \
@@ -1415,6 +1586,10 @@ static __maybe_unused void nsd_do_prefetch(struct file *file, u32 file_id,
 
 stride_chain_emit:
         atomic64_inc(&nsd.st_predictions);
+        if (next_r > r)
+            atomic64_inc(&nsd.st_pred_fwd);
+        else if (next_r < r)
+            atomic64_inc(&nsd.st_pred_rev);
         r = next_r;
 
 
@@ -1523,7 +1698,7 @@ static __maybe_unused void nsd_process(struct file *file, loff_t off, size_t siz
     if (has_prev) {
         s32 stride_delta = (s32)region - (s32)prev_r;
         spin_lock(&nsd.fctx.lock);
-        nsd_workload_update(ctx, region, prev_r, now);
+        nsd_workload_update(ctx, region, prev_r, now, size, has_prev);
         nsd_stride_update(ctx, region, stride_delta);
         spin_unlock(&nsd.fctx.lock);
     }
@@ -1584,6 +1759,13 @@ static __maybe_unused void nsd_process(struct file *file, loff_t off, size_t siz
 
     if (ctx && ctx->wl.active == NSD_STRAT_NONE)
         return;
+
+    if (ctx && ctx->warm_pending) {
+        ctx->warm_pending = 0;
+        get_file(file);
+        nsd_warm_req.file = file;
+        queue_work(nsd.wq, &nsd_warm_req.work);
+    }
 
     nsd_do_prefetch(file, file_id, region, prev_r, has_prev, ctx);
 }
@@ -1721,7 +1903,9 @@ static __maybe_unused void nsd_telem_fn(struct work_struct *work)
 
     pr_info("[NSD] ev=%llu pf=%llu hit=%llu%% syn=%llu drop=%llu "
             "bypass=%llu strat_sw=%llu thresh=%u "
-            "hist_acc=%u/1000 rec_acc=%u/1000 lr=%u/1000\n",
+            "hist_acc=%u/1000 rec_acc=%u/1000 lr=%u/1000 "
+            "wl=s%llu/r%llu/p%llu/m%llu prop=n%llu/m%llu/b%llu/f%llu "
+            "seq_large=%llu warm=%llu hm_t=%llu hm_h=%llu seq_r=%u small_r=%u syn_r=%u\n",
             (unsigned long long)atomic64_read(&nsd.st_events),
             (unsigned long long)pf,
             (unsigned long long)hit,
@@ -1730,7 +1914,25 @@ static __maybe_unused void nsd_telem_fn(struct work_struct *work)
             (unsigned long long)atomic64_read(&nsd.st_seq_bypass),
             (unsigned long long)atomic64_read(&nsd.st_strat_switch),
             READ_ONCE(nsd.thresh),
-            (unsigned)hist_acc, (unsigned)rec_acc, (unsigned)lr);
+            (unsigned)hist_acc, (unsigned)rec_acc, (unsigned)lr,
+            (unsigned long long)atomic64_read(&nsd.st_wl_seq),
+            (unsigned long long)atomic64_read(&nsd.st_wl_random),
+            (unsigned long long)atomic64_read(&nsd.st_wl_pattern),
+            (unsigned long long)atomic64_read(&nsd.st_wl_mixed),
+            (unsigned long long)atomic64_read(&nsd.st_prop_none),
+            (unsigned long long)atomic64_read(&nsd.st_prop_markov),
+            (unsigned long long)atomic64_read(&nsd.st_prop_bigram),
+            (unsigned long long)atomic64_read(&nsd.st_prop_freq),
+            (unsigned long long)atomic64_read(&nsd.st_seq_large),
+            (unsigned long long)atomic64_read(&nsd.st_warm),
+            (unsigned long long)atomic64_read(&nsd.st_hotmap_total),
+            (unsigned long long)atomic64_read(&nsd.st_hotmap_hot),
+            (unsigned)((atomic64_read(&nsd.st_prof_seq_r_sum) /
+                        max(atomic64_read(&nsd.st_prof_windows), (s64)1))),
+            (unsigned)((atomic64_read(&nsd.st_prof_small_r_sum) /
+                        max(atomic64_read(&nsd.st_prof_windows), (s64)1))),
+            (unsigned)((atomic64_read(&nsd.st_prof_syn_r_sum) /
+                        max(atomic64_read(&nsd.st_prof_windows), (s64)1))));
 
     if (atomic_read(&nsd.running))
         queue_delayed_work(nsd.wq, &nsd.telem_work,
@@ -1939,7 +2141,15 @@ static __maybe_unused ssize_t stats_show(struct kobject *k, struct kobj_attribut
         "synapses:%llu\nevicted:%llu\ndropped:%llu\n"
         "seq_bypass:%llu\nstrat_switch:%llu\nautothresh_adj:%llu\n"
         "stride_predictions:%llu\nstride_chain:%llu\n"
+        "pred_fwd:%llu\npred_rev:%llu\npf_fwd:%llu\npf_rev:%llu\n"
         "hist_acc:%u\nrec_acc:%u\nlearning_rate:%u\n"
+        "prof_windows:%llu\nprof_seq_r_avg:%u\nprof_rpt_r_avg:%u\nprof_small_r_avg:%u\n"
+        "prof_syn_r_avg:%u\n"
+        "wl_seq:%llu\nwl_random:%llu\nwl_pattern:%llu\nwl_mixed:%llu\n"
+        "prop_none:%llu\nprop_markov:%llu\nprop_bigram:%llu\nprop_freq:%llu\n"
+        "seq_large:%llu\n"
+        "warm:%llu\nwarm_skip:%llu\n"
+        "hotmap_total:%llu\nhotmap_hot:%llu\n"
         "decay_runs:%llu\ndisabled:%llu\ncoalesced:%llu\nmonitor_ok:%d\n"
         "pending_overwrite:%llu\n""pending_skip:%llu\n""waste_expired:%llu\n",
         NSD_VERSION,
@@ -1970,7 +2180,33 @@ static __maybe_unused ssize_t stats_show(struct kobject *k, struct kobj_attribut
         (unsigned long long)atomic64_read(&nsd.st_autothresh_adj),
         (unsigned long long)atomic64_read(&nsd.st_stride_predictions),
         (unsigned long long)atomic64_read(&nsd.st_stride_chain),
+        (unsigned long long)atomic64_read(&nsd.st_pred_fwd),
+        (unsigned long long)atomic64_read(&nsd.st_pred_rev),
+        (unsigned long long)atomic64_read(&nsd.st_pf_fwd),
+        (unsigned long long)atomic64_read(&nsd.st_pf_rev),
         (unsigned)hist_acc, (unsigned)rec_acc, (unsigned)lr,
+        (unsigned long long)atomic64_read(&nsd.st_prof_windows),
+        (unsigned)((atomic64_read(&nsd.st_prof_seq_r_sum) /
+                    max(atomic64_read(&nsd.st_prof_windows), (s64)1))),
+        (unsigned)((atomic64_read(&nsd.st_prof_rpt_r_sum) /
+                    max(atomic64_read(&nsd.st_prof_windows), (s64)1))),
+        (unsigned)((atomic64_read(&nsd.st_prof_small_r_sum) /
+                    max(atomic64_read(&nsd.st_prof_windows), (s64)1))),
+        (unsigned)((atomic64_read(&nsd.st_prof_syn_r_sum) /
+                    max(atomic64_read(&nsd.st_prof_windows), (s64)1))),
+        (unsigned long long)atomic64_read(&nsd.st_wl_seq),
+        (unsigned long long)atomic64_read(&nsd.st_wl_random),
+        (unsigned long long)atomic64_read(&nsd.st_wl_pattern),
+        (unsigned long long)atomic64_read(&nsd.st_wl_mixed),
+        (unsigned long long)atomic64_read(&nsd.st_prop_none),
+        (unsigned long long)atomic64_read(&nsd.st_prop_markov),
+        (unsigned long long)atomic64_read(&nsd.st_prop_bigram),
+        (unsigned long long)atomic64_read(&nsd.st_prop_freq),
+        (unsigned long long)atomic64_read(&nsd.st_seq_large),
+        (unsigned long long)atomic64_read(&nsd.st_warm),
+        (unsigned long long)atomic64_read(&nsd.st_warm_skip),
+        (unsigned long long)atomic64_read(&nsd.st_hotmap_total),
+        (unsigned long long)atomic64_read(&nsd.st_hotmap_hot),
         (unsigned long long)atomic64_read(&nsd.st_decay),
         (unsigned long long)atomic64_read(&nsd.st_disabled),
         (unsigned long long)atomic64_read(&nsd.st_coalesced),
@@ -2284,6 +2520,8 @@ static int __init nsd_init(void)
         nsd_syn_free();
         return -ENOMEM;
     }
+
+    INIT_WORK(&nsd_warm_req.work, nsd_warm_worker);
 
     atomic_set(&nsd.running, 1);
     if (param_waste_track)
