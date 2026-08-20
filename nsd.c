@@ -16,6 +16,7 @@
 #include <linux/spinlock.h>
 #include <linux/atomic.h>
 #include <linux/blkdev.h>
+#include <linux/pagemap.h>
 #include <linux/workqueue.h>
 #include <linux/kthread.h>
 #include <linux/delay.h>
@@ -30,6 +31,7 @@
 #include <linux/fs.h>
 #include <linux/mm.h>
 #include <linux/fadvise.h>
+#include <linux/backing-dev.h>
 #include <linux/version.h>
 #include <linux/ptrace.h>
 #include <linux/string.h>
@@ -356,6 +358,7 @@ static struct {
     u32  depth;
     u16  thresh;
     u64  prefetch_span;
+    u32  scope_margin;
 
 
     atomic_t running;
@@ -395,6 +398,9 @@ static struct {
     atomic64_t st_pred_rev;
     atomic64_t st_pf_fwd;
     atomic64_t st_pf_rev;
+    atomic64_t st_scope_skip;
+    atomic64_t st_scope_edge;
+    atomic64_t st_scope_jump;
 
     atomic64_t st_prof_windows;
     atomic64_t st_prof_seq_r_sum;
@@ -432,6 +438,7 @@ static struct {
     .depth         = NSD_DEPTH_SSD,
     .thresh        = NSD_THRESH_SSD,
     .prefetch_span = NSD_PREFETCH_SPAN_SSD,
+    .scope_margin  = 10,
     .fctx.lock     = __SPIN_LOCK_UNLOCKED(nsd.fctx.lock),
     .mon_lock      = __SPIN_LOCK_UNLOCKED(nsd.mon_lock),
     .ada_lock      = __SPIN_LOCK_UNLOCKED(nsd.ada_lock),
@@ -1256,6 +1263,13 @@ static __maybe_unused int nsd_fprobe_entry(struct fprobe *fp, unsigned long entr
         nsd_track_micro_seq(inode, off, io_size);
 
     if (true) {
+        struct backing_dev_info *bdi = inode->i_sb ? inode->i_sb->s_bdi : NULL;
+        if (bdi && (loff_t)bdi->ra_pages * PAGE_SIZE >= (1UL << 20)) {
+            /* 1024k+ kernel penceresi: kernel zaten bant tavanına yakın,
+             * modül müdahalesi sadece overhead/zarar üretir - tamamen sus */
+            atomic64_inc(&nsd.st_scope_skip);
+            return 0;
+        }
         atomic64_inc(&nsd.st_kprobe);
         u64 key = (u64)inode->i_ino ^ (u64)(unsigned long)inode->i_sb;
         u32 file_id = hash_64(key, NSD_FCTX_BITS);
@@ -1499,10 +1513,45 @@ static __maybe_unused void nsd_do_prefetch(struct file *file, u32 file_id,
             len = (u64)coalesce_len * (u64)READ_ONCE(nsd.prefetch_span) * \
                   span_mult;                                             \
         }                                                                 \
-        if (strat == NSD_STRAT_MARKOV || strat == NSD_STRAT_BIGRAM)       \
-            vfs_fadvise(file, start, len, POSIX_FADV_SEQUENTIAL);        \
-        else                                                              \
-            vfs_fadvise(file, start, len, POSIX_FADV_WILLNEED | POSIX_FADV_NOREUSE); \
+        bool in_scope = false;                                            \
+        bool edge_shift = false;                                          \
+        loff_t ra_bytes = 0;                                              \
+        loff_t sc_cur = 0;                                                \
+        loff_t sc_mg  = 0;                                                \
+        if (file->f_inode && file->f_inode->i_sb) {                       \
+            struct backing_dev_info *bdi = file->f_inode->i_sb->s_bdi;    \
+            if (bdi)                                                      \
+                ra_bytes = (loff_t)bdi->ra_pages * PAGE_SIZE;             \
+        }                                                                 \
+        if (ra_bytes > 0) {                                               \
+            sc_cur = (loff_t)region << READ_ONCE(nsd.region_shift);       \
+            loff_t pfs = (loff_t)coalesce_start <<                        \
+                         READ_ONCE(nsd.region_shift);                     \
+            sc_mg  = ra_bytes * READ_ONCE(nsd.scope_margin) / 100;        \
+            if (pfs >= sc_cur - ra_bytes - sc_mg &&                       \
+                pfs <= sc_cur + ra_bytes + sc_mg)                         \
+                in_scope = true;                                          \
+            if (ra_bytes < (1UL << 20))                                   \
+                edge_shift = true;                                        \
+        }                                                                 \
+        if (in_scope && !edge_shift) {                                    \
+            atomic64_inc(&nsd.st_scope_skip);                             \
+        } else {                                                          \
+            if (in_scope && edge_shift) {                                 \
+                start = sc_cur + ra_bytes + sc_mg;                        \
+                atomic64_inc(&nsd.st_scope_edge);                         \
+                if (strat == NSD_STRAT_MARKOV ||                          \
+                    strat == NSD_STRAT_BIGRAM)                             \
+                    vfs_fadvise(file, start, len, POSIX_FADV_SEQUENTIAL); \
+                else                                                      \
+                    vfs_fadvise(file, start, len, POSIX_FADV_WILLNEED |   \
+                                POSIX_FADV_NOREUSE);                      \
+            } else {                                                      \
+                atomic64_inc(&nsd.st_scope_jump);                         \
+                vfs_fadvise(file, start, len, POSIX_FADV_WILLNEED |       \
+                            POSIX_FADV_NOREUSE);                          \
+            }                                                             \
+        }                                                                 \
         if (coalesce_len > 1)                                            \
             atomic64_inc(&nsd.st_coalesced);                             \
         atomic64_inc(&nsd.st_prefetch);                                  \
@@ -2151,7 +2200,9 @@ static __maybe_unused ssize_t stats_show(struct kobject *k, struct kobj_attribut
         "warm:%llu\nwarm_skip:%llu\n"
         "hotmap_total:%llu\nhotmap_hot:%llu\n"
         "decay_runs:%llu\ndisabled:%llu\ncoalesced:%llu\nmonitor_ok:%d\n"
-        "pending_overwrite:%llu\n""pending_skip:%llu\n""waste_expired:%llu\n",
+        "pending_overwrite:%llu\n""pending_skip:%llu\n""waste_expired:%llu\n"
+        "scope_skip:%llu\nscope_margin:%u\n"
+        "scope_edge:%llu\nscope_jump:%llu\n",
         NSD_VERSION,
         atomic_read(&nsd.running),
         atomic_read(&nsd.hook_reg),
@@ -2213,7 +2264,11 @@ static __maybe_unused ssize_t stats_show(struct kobject *k, struct kobj_attribut
         (unsigned)mok,
         (unsigned long long)atomic64_read(&nsd.st_pending_overwrite),
         (unsigned long long)atomic64_read(&nsd.st_pending_skip),
-        (unsigned long long)atomic64_read(&nsd.st_waste_expired));
+        (unsigned long long)atomic64_read(&nsd.st_waste_expired),
+        (unsigned long long)atomic64_read(&nsd.st_scope_skip),
+        READ_ONCE(nsd.scope_margin),
+        (unsigned long long)atomic64_read(&nsd.st_scope_edge),
+        (unsigned long long)atomic64_read(&nsd.st_scope_jump));
 
     return len;
 }
@@ -2480,10 +2535,28 @@ static struct kobj_attribute a_feat       = __ATTR(features, 0644, features_show
 static struct kobj_attribute a_fctx_debug = __ATTR_RO(fctx_debug);
 static struct kobj_attribute a_dev_class  = __ATTR(dev_class, 0644, dev_class_show, dev_class_store);
 
+static __maybe_unused ssize_t scope_margin_show(struct kobject *k,
+                              struct kobj_attribute *a, char *buf)
+{
+    (void)k; (void)a;
+    return scnprintf(buf, PAGE_SIZE, "%u\n", READ_ONCE(nsd.scope_margin));
+}
+static __maybe_unused ssize_t scope_margin_store(struct kobject *k,
+                               struct kobj_attribute *a,
+                               const char *buf, size_t n)
+{
+    unsigned v;
+    (void)k; (void)a;
+    if (kstrtouint(buf, 10, &v) || v > 100) return -EINVAL;
+    WRITE_ONCE(nsd.scope_margin, v);
+    return n;
+}
+static struct kobj_attribute a_scope      = __ATTR(scope_margin, 0644, scope_margin_show, scope_margin_store);
+
 static struct attribute *nsd_attrs[] = {
     &a_stats.attr, &a_hook.attr, &a_obs.attr, &a_mode.attr,
     &a_depth.attr, &a_thresh.attr, &a_feat.attr, &a_fctx_debug.attr,
-    &a_dev_class.attr,
+    &a_dev_class.attr, &a_scope.attr,
     NULL,
 };
 static struct attribute_group nsd_ag = { .attrs = nsd_attrs };

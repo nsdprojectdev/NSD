@@ -1,3 +1,43 @@
+# NSD v1 - Changelog
+
+## 2026-08-20 - Window-size matrix, scope handling & full instrumentation
+
+### Window-size matrix (v2.4)
+
+Full matrix across read_ahead_kb 128k..1M x {seq64, sqlite, random4k,
+random_repeat} x ON/OFF x 3 runs. Disk I/O byte-identical between ON/OFF
+in all 96 runs (NSD never issues extra I/O).
+
+  read_ahead_kb  |  seq64 (64k req)      |  SQLite Q2 scan
+                 |  OFF     ON      d%   |  OFF     ON      d%
+  128            |  22.02s  17.11s  -22% |  24.51s  20.48s  -16%
+  256            |  17.08s  17.22s  +1%  |  20.05s  16.60s  -17%
+  512            |  16.81s  16.96s  +1%  |  15.31s  12.18s  -20%
+  1024           |  17.25s  17.03s  -1%  |  12.22s  12.09s  -1%
+
+Key finding: at 1M the kernel alone reaches the SSD bandwidth ceiling and
+NSD silences itself entirely (kernel-window awareness). NSD + 512k matches
+kernel + 1M (12.18s vs 12.22s) - the kernel window growth is capped at
+ra_pages while the fadvise-driven expansion NSD triggers is not.
+
+### Scope handling (v2.2)
+
+Added st_scope_jump counter; jumps (predictions landing outside the kernel
+readahead window) now always issue WILLNEED|NOREUSE explicitly. SQLite
+1024k confirmed neutral (scope_jump=3/613082) - no jumps at large windows.
+
+### Kernel-window awareness (v2.3)
+
+When the kernel readahead window (bdi->ra_pages) is already >= 1MB, the
+module detects this and completely silences itself (verified by its own
+counters). Fixes the -19% seq regression at 1024k; the 512k -20% gain is
+preserved.
+
+### Full instrumentation (v2.4)
+
+Per-run p50/p95/p99/p999 latency and per-pass usr/sys CPU overhead are
+now collected by the benchmark harness, plus disk-I/O accounting.
+
 # NSD v1 — Changelog
 
 ## 2026-07-19 — waste_track Bug Fix, Metric Analysis & Kprobe Verification
