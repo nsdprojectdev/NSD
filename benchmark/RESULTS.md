@@ -97,3 +97,20 @@ NSD Stats (ON):
 |--------|-------------|-------|
 | **SSD** | **+20.5%** (seq 64K, buffered) | Stable, repeatable |
 | **HDD** | **−4% to 0%** | Neutral, no regression |
+
+## 2026-08-20 - Window-size matrix (v2.4)
+
+Interleaved ON/OFF on the same machine, drop_caches before every run,
+3 runs per configuration. 6.2 GB SQLite DB (Q2 full scan), 8 GB
+sequential file (64k requests). Disk I/O byte-identical between ON/OFF
+in all 96 runs.
+
+  kb    | seq64 OFF  ON    d%   | sqlite OFF  ON    d%   | p99 seq64 (us)
+  128   | 22.02  17.11 -22%   | 24.51  20.48 -16%   | 812 -> 805
+  256   | 17.08  17.22 +1%    | 20.05  16.60 -17%   | 824 -> 1129
+  512   | 16.81  16.96 +1%    | 15.31  12.18 -20%   | 1092 -> 1903
+  1024  | 17.25  17.03 -1%    | 12.22  12.09 -1%    | 1903 -> 1883
+
+random4k: fully neutral at all window sizes. random_repeat: -6% (128k),
+-4% (256k), p95 296 -> 243 us. At >= 1M kernel window the module
+silences itself entirely (verified by counters).
